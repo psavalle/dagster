@@ -230,3 +230,24 @@ def test_comparison():
     assert resolve_dagster_type(
         dg.Dict[dg.Int, dg.Dict[dg.String, dg.Int]]
     ) != resolve_dagster_type(dg.Dict[dg.String, dg.Dict[dg.String, dg.Int]])
+
+
+def test_resolve_dagster_type_is_memoized():
+    class SomeClass:
+        pass
+
+    for annotation in (int, str, dg.Int, list[int], dict[str, int], SomeClass):
+        assert resolve_dagster_type(annotation) is resolve_dagster_type(annotation)
+
+    assert resolve_dagster_type(list[int]) is resolve_dagster_type(list[int])
+
+    # An unhashable input (e.g. an instance where a type was meant) raises
+    with pytest.raises(dg.DagsterInvalidDefinitionError, match="hashable"):
+        resolve_dagster_type({"not": "a type"})
+
+    # A DagsterType resolves to itself and bypasses the cache: two distinct DagsterTypes
+    # an compare equal and must not be substituted for one another.
+    foo_a = dg.DagsterType(name="Foo", type_check_fn=lambda _, _v: True)
+    foo_b = dg.DagsterType(name="Foo", type_check_fn=lambda _, _v: False)
+    assert resolve_dagster_type(foo_a) is foo_a
+    assert resolve_dagster_type(foo_b) is foo_b
