@@ -879,7 +879,28 @@ class TypeHintInferredDagsterType(DagsterType):
         return self.python_type.__name__
 
 
+# ``resolve_dagster_type`` maps a type annotation to its DagsterType and is called for every op
+# input/output while building definitions. The mapping is a deterministic function of the annotation
+# value, and the DagsterTypes it returns are already shared/interned. Unhashable inputs bypass the
+# cache.
+_RESOLVE_DAGSTER_TYPE_CACHE: "t.Dict[t.Any, DagsterType]" = {}
+
+
 def resolve_dagster_type(dagster_type: object) -> DagsterType:
+    if isinstance(dagster_type, DagsterType): # A DagsterType resolves to itself, no need to cache
+        return dagster_type
+    try:
+        return _RESOLVE_DAGSTER_TYPE_CACHE[dagster_type]
+    except KeyError:
+        pass
+    except TypeError:  # unhashable, do not cache
+        return _resolve_dagster_type_uncached(dagster_type)
+    resolved = _resolve_dagster_type_uncached(dagster_type)
+    _RESOLVE_DAGSTER_TYPE_CACHE[dagster_type] = resolved
+    return resolved
+
+
+def _resolve_dagster_type_uncached(dagster_type: object) -> DagsterType:
     # circular dep
     from dagster._core.definitions.result import MaterializeResult, ObserveResult
     from dagster._core.types.primitive_mapping import (
