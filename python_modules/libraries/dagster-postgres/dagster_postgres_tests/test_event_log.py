@@ -237,12 +237,16 @@ def test_all_asset_keys_excludes_wiped_asset_on_legacy_index_path(conn_string):
 
 
 @contextmanager
-def _queued_cancellation_instance(conn_string):
+def _queued_cancellation_instance(conn_string, use_default_launcher=False):
+    overrides = {"storage": {"postgres": {"postgres_url": conn_string}}}
+    if use_default_launcher:
+        overrides["run_launcher"] = {
+            "module": "dagster._core.launcher.default_run_launcher",
+            "class": "DefaultRunLauncher",
+        }
     with (
         _clean_storage(conn_string),
-        instance_for_test(
-            overrides={"storage": {"postgres": {"postgres_url": conn_string}}}
-        ) as instance,
+        instance_for_test(overrides=overrides) as instance,
     ):
         instance.wipe()
         yield instance
@@ -303,16 +307,23 @@ def test_run_cancellation_batch(conn_string):
                 assert deserialize_value(body, DagsterRun).status == DagsterRunStatus.CANCELED
 
 
+@pytest.mark.parametrize("cancel_queued", [False, True])
 @pytest.mark.parametrize("failure_point", ["event_insert", "notification", "later_chunk"])
-def test_atomic_cancellation_rolls_back_all_state(conn_string, failure_point):
-    from dagster._core.storage.dagster_run import DagsterRunStatus
+def test_atomic_cancellation_rolls_back_all_state(conn_string, failure_point, cancel_queued):
+    from dagster._core.storage.dagster_run import DagsterRunStatus, RunsFilter
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
     from sqlalchemy import event as sql_event
 
     with _queued_cancellation_instance(conn_string) as instance:
-        runs = [
-            _create_queued_run(instance)
-            for _ in range(501 if failure_point == "later_chunk" else 2)
-        ]
+        create_run = _create_queued_run if cancel_queued else _create_started_run
+        report = (
+            instance.report_run_cancellation_batch
+            if cancel_queued
+            else instance.report_run_canceling_batch
+        )
+        original_status = DagsterRunStatus.QUEUED if cancel_queued else DagsterRunStatus.STARTED
+        target_status = DagsterRunStatus.CANCELED if cancel_queued else DagsterRunStatus.CANCELING
+        runs = [create_run(instance) for _ in range(501 if failure_point == "later_chunk" else 2)]
         inserts = 0
 
         def fail(conn, cursor, statement, parameters, context, executemany):
@@ -329,14 +340,15 @@ def test_atomic_cancellation_rolls_back_all_state(conn_string, failure_point):
         sql_event.listen(Engine, "before_cursor_execute", fail)
         try:
             with pytest.raises(RuntimeError, match="injected transaction failure"):
-                instance.report_run_cancellation_batch(runs)
+                report(runs)
         finally:
             sql_event.remove(Engine, "before_cursor_execute", fail)
-        assert all(run.status == DagsterRunStatus.QUEUED for run in instance.get_runs())
+        assert all(run.status == original_status for run in instance.get_runs())
+        assert not instance.get_run_ids(RunsFilter(tags={RUN_TERMINATION_REQUESTED_TAG: "true"}))
         assert not instance.all_logs(runs[0].run_id)
         assert not instance.all_logs(runs[-1].run_id)
-        instance.report_run_cancellation_batch(runs)
-        assert all(run.status == DagsterRunStatus.CANCELED for run in instance.get_runs())
+        report(runs)
+        assert all(run.status == target_status for run in instance.get_runs())
 
 
 def test_atomic_cancellation_revalidates_status(conn_string):
@@ -450,3 +462,238 @@ def test_postgres_mixed_storage_does_not_enable_atomic_fast_path(conn_string):
         run = _create_queued_run(instance)
         instance.report_run_cancellation_batch([run])
         assert len(instance.all_logs(run.run_id)) == 2
+
+
+def _create_started_run(instance):
+    from dagster._core.storage.dagster_run import DagsterRunStatus
+    from dagster._core.storage.tags import BACKFILL_ID_TAG
+    from dagster._core.test_utils import create_run_for_test
+
+    return create_run_for_test(
+        instance, status=DagsterRunStatus.STARTED, tags={BACKFILL_ID_TAG: "backfill"}
+    )
+
+
+@contextmanager
+def _started_cancellation_instance(conn_string, num_runs=3):
+    import json
+
+    from dagster._core.storage.tags import GRPC_INFO_TAG
+    from dagster_tests.launcher_tests.test_batch_termination import cancellation_server
+
+    with _queued_cancellation_instance(conn_string, use_default_launcher=True) as instance:
+        runs = [_create_started_run(instance) for _ in range(num_runs)]
+        with cancellation_server([run.run_id for run in runs]) as (server, client):
+            for run in runs:
+                instance.add_run_tags(
+                    run.run_id,
+                    {GRPC_INFO_TAG: json.dumps({"host": client.host, "port": client.port})},
+                )
+            yield instance, [instance.get_run_by_id(run.run_id) for run in runs], server
+
+
+def test_started_cancellation_batches_sql_and_preserves_running_state(conn_string):
+    from dagster._core.storage.dagster_run import DagsterRun, DagsterRunStatus, RunsFilter
+    from dagster._core.storage.runs.schema import RunsTable
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+    from dagster._serdes import deserialize_value
+    from sqlalchemy import event as sql_event
+
+    with _queued_cancellation_instance(conn_string) as instance:
+        runs = [_create_started_run(instance) for _ in range(3)]
+        statements = []
+
+        def observe(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        sql_event.listen(Engine, "before_cursor_execute", observe)
+        try:
+            marked = instance.report_run_canceling_batch(runs)
+        finally:
+            sql_event.remove(Engine, "before_cursor_execute", observe)
+        assert {run.run_id for run in marked} == {run.run_id for run in runs}
+        for prefix in ["UPDATE runs", "INSERT INTO event_logs", "INSERT INTO run_tags"]:
+            assert len([statement for statement in statements if statement.startswith(prefix)]) == 1
+        assert len([statement for statement in statements if "pg_notify" in statement]) == 1
+        assert set(
+            instance.get_run_ids(RunsFilter(tags={RUN_TERMINATION_REQUESTED_TAG: "true"}))
+        ) == {run.run_id for run in runs}
+        for run in runs:
+            record = instance.get_run_record_by_id(run.run_id)
+            assert record.dagster_run.status == DagsterRunStatus.CANCELING
+            assert record.end_time is None
+            assert record.dagster_run.tags[RUN_TERMINATION_REQUESTED_TAG] == "true"
+            assert [event.dagster_event_type for event in instance.all_logs(run.run_id)] == [
+                DagsterEventType.RUN_CANCELING
+            ]
+        # Repeated requests reuse the persisted intent.
+        assert len(instance.report_run_canceling_batch(runs)) == 3
+        for run in runs:
+            assert len(instance.all_logs(run.run_id)) == 1
+        with instance.run_storage.connect() as conn:
+            for (body,) in conn.execute(RunsTable.select().with_only_columns(RunsTable.c.run_body)):
+                persisted = deserialize_value(body, DagsterRun)
+                assert persisted.status == DagsterRunStatus.CANCELING
+                assert persisted.tags[RUN_TERMINATION_REQUESTED_TAG] == "true"
+
+
+def test_started_cancellation_revalidates_terminal_status_and_route(conn_string):
+    from dagster._core.storage.tags import GRPC_INFO_TAG
+
+    with _queued_cancellation_instance(conn_string) as instance:
+        finished, moved, active = [_create_started_run(instance) for _ in range(3)]
+        instance.report_dagster_event(
+            DagsterEvent(DagsterEventType.RUN_SUCCESS.value, job_name=finished.job_name),
+            finished.run_id,
+        )
+        instance.add_run_tags(moved.run_id, {GRPC_INFO_TAG: "changed"})
+        assert [
+            run.run_id for run in instance.report_run_canceling_batch([finished, moved, active])
+        ] == [active.run_id]
+        assert not instance.all_logs(moved.run_id)
+        assert [event.dagster_event_type for event in instance.all_logs(finished.run_id)] == [
+            DagsterEventType.RUN_SUCCESS
+        ]
+
+
+@pytest.mark.parametrize("failure", ["before_rpc", "lost_rpc_reply", "lost_commit_reply"])
+def test_started_cancellation_recovers_durable_intents(conn_string, failure):
+    import logging
+
+    from dagster._core.errors import DagsterUserCodeUnreachableError
+    from dagster._core.execution.backfill import cancel_backfill_runs_and_cancellation_complete
+    from dagster._core.storage.dagster_run import DagsterRunStatus, RunsFilter
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+    from dagster._grpc.client import DagsterGrpcClient
+
+    with _started_cancellation_instance(conn_string) as (instance, runs, server):
+        launcher = instance.run_launcher
+        original = DagsterGrpcClient.cancel_executions
+
+        def fail_rpc(self, run_ids, **kwargs):
+            if failure == "lost_rpc_reply":
+                original(self, run_ids, **kwargs)
+            raise DagsterUserCodeUnreachableError("injected lost RPC")
+
+        def fail_commit(runs):
+            instance.event_log_storage.mark_runs_canceling(runs)
+            raise RuntimeError("injected lost commit reply")
+
+        if failure == "lost_commit_reply":
+            with patch.object(instance, "report_run_canceling_batch", side_effect=fail_commit):
+                with pytest.raises(RuntimeError, match="lost commit reply"):
+                    launcher.terminate_runs([run.run_id for run in runs])
+        else:
+            with patch.object(DagsterGrpcClient, "cancel_executions", fail_rpc):
+                with pytest.raises(DagsterUserCodeUnreachableError, match="lost RPC"):
+                    launcher.terminate_runs([run.run_id for run in runs])
+        assert (
+            len(
+                instance.get_runs(
+                    RunsFilter(
+                        statuses=[DagsterRunStatus.CANCELING],
+                        tags={RUN_TERMINATION_REQUESTED_TAG: "true"},
+                    )
+                )
+            )
+            == 3
+        )
+        deadlines = dict(server._termination_times)  # noqa: SLF001
+        assert not cancel_backfill_runs_and_cancellation_complete(
+            instance, "backfill", logging.getLogger(__name__)
+        )
+        assert all(flag.is_set() for flag in server._termination_events.values())  # noqa: SLF001
+        assert all(
+            server._termination_times[run_id] == deadline  # noqa: SLF001
+            for run_id, deadline in deadlines.items()
+        )
+        assert all(len(instance.all_logs(run.run_id)) == 1 for run in runs)
+        for run in runs:
+            instance.report_run_canceled(instance.get_run_by_id(run.run_id))
+        assert cancel_backfill_runs_and_cancellation_complete(
+            instance, "backfill", logging.getLogger(__name__)
+        )
+
+
+def test_concurrent_started_cancellation_does_not_duplicate_intents(conn_string):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dagster._core.storage.runs.schema import RunTagsTable
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+
+    with _queued_cancellation_instance(conn_string) as instance:
+        runs = [_create_started_run(instance) for _ in range(3)]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(instance.report_run_canceling_batch, runs) for _ in range(2)]
+            assert all(len(future.result()) == len(runs) for future in futures)
+        assert all(len(instance.all_logs(run.run_id)) == 1 for run in runs)
+        with instance.run_storage.connect() as conn:
+            rows = conn.execute(
+                RunTagsTable.select().where(RunTagsTable.c.key == RUN_TERMINATION_REQUESTED_TAG)
+            ).fetchall()
+        assert len(rows) == len(runs)
+
+
+def test_started_listener_still_observes_serial_reporting(conn_string):
+    from dagster._core.storage.dagster_run import DagsterRunStatus
+
+    with _started_cancellation_instance(conn_string, num_runs=1) as (instance, runs, _):
+        run = runs[0]
+        seen = []
+        instance.add_event_listener(
+            run.run_id,
+            lambda event: seen.append(
+                (event.dagster_event_type, instance.get_run_by_id(run.run_id).status)
+            ),
+        )
+        with patch.object(instance.event_log_storage, "mark_runs_canceling") as batch:
+            assert instance.run_launcher.terminate_runs([run.run_id]) == {run.run_id: True}
+            batch.assert_not_called()
+        assert seen == [(DagsterEventType.RUN_CANCELING, DagsterRunStatus.CANCELING)]
+
+
+def test_started_intent_survives_legacy_server_and_stale_run_body(conn_string):
+    import grpc
+    from dagster._core.storage.dagster_run import DagsterRunStatus
+    from dagster._core.storage.runs.schema import RunsTable
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+    from dagster._grpc.server import DagsterApiServer
+    from dagster._serdes import serialize_value
+    from dagster_tests.launcher_tests.test_batch_termination import cancellation_server
+
+    with _queued_cancellation_instance(conn_string, use_default_launcher=True) as instance:
+        run = _create_started_run(instance)
+        instance.report_run_canceling_batch([run])
+        # A concurrent tag writer can replace the serialized run body.
+        with instance.run_storage.connect() as conn:
+            conn.execute(
+                RunsTable.update()
+                .where(RunsTable.c.run_id == run.run_id)
+                .values(run_body=serialize_value(run.with_status(DagsterRunStatus.CANCELING)))
+            )
+        assert RUN_TERMINATION_REQUESTED_TAG not in instance.get_run_by_id(run.run_id).tags
+
+        def unimplemented(request, context):
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "old server")
+
+        with (
+            patch.object(DagsterApiServer, "CancelExecutions", side_effect=unimplemented),
+            cancellation_server([run.run_id]) as (legacy, legacy_client),
+        ):
+            import json
+
+            from dagster._core.storage.tags import GRPC_INFO_TAG
+
+            instance.add_run_tags(
+                run.run_id,
+                {
+                    GRPC_INFO_TAG: json.dumps(
+                        {"host": legacy_client.host, "port": legacy_client.port}
+                    )
+                },
+            )
+            assert instance.run_launcher.terminate_runs([run.run_id])[run.run_id]
+            deadline = legacy._termination_times[run.run_id]  # noqa: SLF001
+            instance.run_launcher.terminate_runs([run.run_id])
+            assert legacy._termination_times[run.run_id] == deadline  # noqa: SLF001
+        assert len(instance.all_logs(run.run_id)) == 1

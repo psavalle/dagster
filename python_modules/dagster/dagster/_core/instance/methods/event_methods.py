@@ -464,18 +464,7 @@ class EventMethods:
             return
         use_batch = (
             self._event_storage_impl.supports_queued_run_cancellation
-            and not any(self._subscribers_impl.get(run.run_id) for run in runs)
-            and all(
-                getattr(getattr(self, method), "__func__", None) is getattr(EventMethods, method)
-                for method in (
-                    "report_run_canceling",
-                    "report_run_canceled",
-                    "report_dagster_event",
-                    "handle_new_event",
-                    "store_event",
-                    "should_store_event",
-                )
-            )
+            and self._can_batch_cancellation_reporting(runs)
         )
         if use_batch:
             self._event_storage_impl.cancel_queued_runs(runs)
@@ -483,6 +472,36 @@ class EventMethods:
             for run in runs:
                 self.report_run_canceling(run, message="Canceling run from the queue.")
                 self.report_run_canceled(run)
+
+    def _can_batch_cancellation_reporting(self, runs: Sequence["DagsterRun"]) -> bool:
+        return not any(self._subscribers_impl.get(run.run_id) for run in runs) and all(
+            getattr(getattr(self, method), "__func__", None) is getattr(EventMethods, method)
+            for method in (
+                "report_run_canceling",
+                "report_run_canceled",
+                "report_dagster_event",
+                "handle_new_event",
+                "store_event",
+                "should_store_event",
+            )
+        )
+
+    def can_report_run_canceling_batch(self, runs: Sequence["DagsterRun"]) -> bool:
+        return (
+            self._event_storage_impl.supports_run_canceling_batch
+            and self._can_batch_cancellation_reporting(runs)
+        )
+
+    def report_run_canceling_batch(
+        self, runs: Sequence["DagsterRun"]
+    ) -> Sequence["DagsterRun"] | None:
+        """Mark eligible runs atomically, or return None without writes when unsupported."""
+        from dagster._core.storage.dagster_run import DagsterRun
+
+        check.sequence_param(runs, "runs", of_type=DagsterRun)
+        if not self.can_report_run_canceling_batch(runs):
+            return None
+        return self._event_storage_impl.mark_runs_canceling(runs)
 
     def report_run_failed(
         self,

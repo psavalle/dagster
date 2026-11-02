@@ -18,7 +18,7 @@ from dagster._core.events import (
 )
 from dagster._core.events.log import EventLogEntry
 from dagster._core.storage.config import pg_config
-from dagster._core.storage.dagster_run import DagsterRun, DagsterRunStatus
+from dagster._core.storage.dagster_run import NOT_FINISHED_STATUSES, DagsterRun, DagsterRunStatus
 from dagster._core.storage.event_log import (
     AssetKeyTable,
     DynamicPartitionsTable,
@@ -29,7 +29,7 @@ from dagster._core.storage.event_log import (
 from dagster._core.storage.event_log.base import EventLogCursor
 from dagster._core.storage.event_log.migration import ASSET_KEY_INDEX_COLS
 from dagster._core.storage.event_log.polling_event_watcher import SqlPollingEventWatcher
-from dagster._core.storage.runs.schema import RunsTable
+from dagster._core.storage.runs.schema import RunsTable, RunTagsTable
 from dagster._core.storage.runs.sql_run_storage import SqlRunStorage
 from dagster._core.storage.sql import (
     AlembicVersion,
@@ -39,6 +39,7 @@ from dagster._core.storage.sql import (
     stamp_alembic_rev,
 )
 from dagster._core.storage.sqlalchemy_compat import db_result, db_select
+from dagster._core.storage.tags import GRPC_INFO_TAG, RUN_TERMINATION_REQUESTED_TAG
 from dagster._serdes import (
     ConfigurableClass,
     ConfigurableClassData,
@@ -238,7 +239,7 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
             self.store_asset_check_event(event, event_id)
 
     @property
-    def supports_queued_run_cancellation(self) -> bool:
+    def _supports_cancellation_transactions(self) -> bool:
         # The transaction requires stock run/event stores in one database.
         from dagster_postgres.run_storage import PostgresRunStorage
 
@@ -255,29 +256,70 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
             is SqlRunStorage.handle_run_event
         )
 
+    @property
+    def supports_queued_run_cancellation(self) -> bool:
+        return self._supports_cancellation_transactions
+
+    @property
+    def supports_run_canceling_batch(self) -> bool:
+        return self._supports_cancellation_transactions
+
     def cancel_queued_runs(self, runs: Sequence[DagsterRun]) -> Sequence[str]:
+        return [
+            run.run_id for run in self._write_cancellation_state(runs, DagsterRunStatus.CANCELED)
+        ]
+
+    def mark_runs_canceling(self, runs: Sequence[DagsterRun]) -> Sequence[DagsterRun]:
+        return self._write_cancellation_state(runs, DagsterRunStatus.CANCELING)
+
+    def _write_cancellation_state(
+        self, runs: Sequence[DagsterRun], target_status: DagsterRunStatus
+    ) -> Sequence[DagsterRun]:
         from dagster_postgres.run_storage import PostgresRunStorage
 
         check.sequence_param(runs, "runs", of_type=DagsterRun)
-        check.invariant(self.supports_queued_run_cancellation, "Incompatible queued-run storage")
-        run_ids = sorted({run.run_id for run in runs})
+        check.invariant(
+            self._supports_cancellation_transactions, "Incompatible cancellation storage"
+        )
+        check.invariant(target_status in {DagsterRunStatus.CANCELING, DagsterRunStatus.CANCELED})
+        expected = {run.run_id: run for run in runs}
+        run_ids = sorted(expected)
         if not run_ids:
             return []
         run_storage = check.inst(self._instance.run_storage, PostgresRunStorage)
-        has_end_time = run_storage.has_run_stats_index_cols()
-        canceled_ids: list[str] = []
-        # All chunks share one explicit transaction.
+        cancel_queued = target_status == DagsterRunStatus.CANCELED
+        has_end_time = cancel_queued and run_storage.has_run_stats_index_cols()
+        allowed = [DagsterRunStatus.QUEUED] if cancel_queued else NOT_FINISHED_STATUSES
+        event_specs = [
+            (
+                DagsterEventType.RUN_CANCELING,
+                "Canceling run from the queue."
+                if cancel_queued
+                else "Sending run termination request.",
+                logging.INFO,
+            )
+        ]
+        if cancel_queued:
+            event_specs.append(
+                (
+                    DagsterEventType.RUN_CANCELED,
+                    "This run has been marked as canceled from outside the execution context.",
+                    logging.ERROR,
+                )
+            )
+        marked: list[DagsterRun] = []
         with self._connect() as connection:
             conn = connection.execution_options(isolation_level="READ COMMITTED")
             with conn.begin():
                 for offset in range(0, len(run_ids), 500):
+                    chunk_ids = run_ids[offset : offset + 500]
                     rows = (
                         conn.execute(
                             db_select([RunsTable])
                             .where(
                                 db.and_(
-                                    RunsTable.c.run_id.in_(run_ids[offset : offset + 500]),
-                                    RunsTable.c.status == DagsterRunStatus.QUEUED.value,
+                                    RunsTable.c.run_id.in_(chunk_ids),
+                                    RunsTable.c.status.in_([status.value for status in allowed]),
                                 )
                             )
                             .order_by(RunsTable.c.run_id.asc())
@@ -288,27 +330,46 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
                     )
                     if not rows:
                         continue
+                    existing_intents = set()
+                    if not cancel_queued:
+                        existing_intents = set(
+                            conn.execute(
+                                db_select([RunTagsTable.c.run_id]).where(
+                                    db.and_(
+                                        RunTagsTable.c.run_id.in_(chunk_ids),
+                                        RunTagsTable.c.key == RUN_TERMINATION_REQUESTED_TAG,
+                                        RunTagsTable.c.value == "true",
+                                    )
+                                )
+                            ).scalars()
+                        )
                     timestamp = get_current_timestamp()
                     events: list[EventLogEntry] = []
                     run_bodies: dict[str, str] = {}
                     for row in rows:
-                        run = deserialize_value(row["run_body"], DagsterRun)
-                        canceled_ids.append(run.run_id)
-                        run_bodies[run.run_id] = serialize_value(
-                            run.with_status(DagsterRunStatus.CANCELED)
+                        run = deserialize_value(row["run_body"], DagsterRun).with_status(
+                            DagsterRunStatus(row["status"])
                         )
-                        for event_type, message, level in (
-                            (
-                                DagsterEventType.RUN_CANCELING,
-                                "Canceling run from the queue.",
-                                logging.INFO,
-                            ),
-                            (
-                                DagsterEventType.RUN_CANCELED,
-                                "This run has been marked as canceled from outside the execution context.",
-                                logging.ERROR,
-                            ),
-                        ):
+                        if not cancel_queued:
+                            if run.tags.get(GRPC_INFO_TAG) != expected[run.run_id].tags.get(
+                                GRPC_INFO_TAG
+                            ):
+                                continue
+                            if (
+                                run.status == DagsterRunStatus.CANCELING
+                                and run.run_id in existing_intents
+                            ):
+                                marked.append(
+                                    run.with_tags(
+                                        {**run.tags, RUN_TERMINATION_REQUESTED_TAG: "true"}
+                                    )
+                                )
+                                continue
+                            run = run.with_tags({**run.tags, RUN_TERMINATION_REQUESTED_TAG: "true"})
+                        updated = run.with_status(target_status)
+                        marked.append(updated)
+                        run_bodies[run.run_id] = serialize_value(updated)
+                        for event_type, message, level in event_specs:
                             events.append(
                                 EventLogEntry(
                                     user_message="",
@@ -324,8 +385,10 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
                                     ),
                                 )
                             )
+                    if not run_bodies:
+                        continue
                     values: dict[str, Any] = {
-                        "status": DagsterRunStatus.CANCELED.value,
+                        "status": target_status.value,
                         "run_body": db.case(run_bodies, value=RunsTable.c.run_id),
                         "update_timestamp": datetime_from_timestamp(timestamp),
                     }
@@ -336,6 +399,28 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
                         .where(RunsTable.c.run_id.in_(run_bodies))
                         .values(**values)
                     )
+                    if not cancel_queued:
+                        # The locked runs serialize writers of this reserved intent tag.
+                        conn.execute(
+                            RunTagsTable.delete().where(
+                                db.and_(
+                                    RunTagsTable.c.run_id.in_(run_bodies),
+                                    RunTagsTable.c.key == RUN_TERMINATION_REQUESTED_TAG,
+                                )
+                            )
+                        )
+                        conn.execute(
+                            RunTagsTable.insert().values(
+                                [
+                                    {
+                                        "run_id": run_id,
+                                        "key": RUN_TERMINATION_REQUESTED_TAG,
+                                        "value": "true",
+                                    }
+                                    for run_id in run_bodies
+                                ]
+                            )
+                        )
                     result = conn.execute(
                         self.prepare_insert_event_batch(events).returning(
                             SqlEventLogStorageTable.c.run_id, SqlEventLogStorageTable.c.id
@@ -352,7 +437,7 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
                         ),
                         {"channel": CHANNEL_NAME, "notifications": notifications},
                     ).close()
-        return canceled_ids
+        return marked
 
     def store_event_batch(self, events: Sequence[EventLogEntry]) -> None:
         from dagster import DagsterEventType

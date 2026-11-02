@@ -29,7 +29,7 @@ from dagster._core.storage.dagster_run import (
     DagsterRunStatus,
     RunsFilter,
 )
-from dagster._core.storage.tags import BACKFILL_ID_TAG, USER_TAG
+from dagster._core.storage.tags import BACKFILL_ID_TAG, RUN_TERMINATION_REQUESTED_TAG, USER_TAG
 from dagster._core.workspace.context import BaseWorkspaceRequestContext
 from dagster._record import record
 from dagster._serdes import whitelist_for_serdes
@@ -574,6 +574,12 @@ def cancel_backfill_runs_and_cancellation_complete(
 
     tags = {BACKFILL_ID_TAG: backfill_id}
     phases = [RunsFilter(statuses=[DagsterRunStatus.QUEUED], tags=tags)]
+    phases.append(
+        RunsFilter(
+            statuses=[DagsterRunStatus.CANCELING],
+            tags={**tags, RUN_TERMINATION_REQUESTED_TAG: "true"},
+        )
+    )
     phases.append(
         RunsFilter(
             statuses=[
