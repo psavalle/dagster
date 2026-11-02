@@ -97,10 +97,11 @@ def test_old_server_uses_single_rpc_fallback():
     assert all(item.success for item in response.results.values())
 
 
-def test_empty_batch_does_not_contact_server():
+@pytest.mark.parametrize("require_idempotent", [False, True])
+def test_empty_batch_does_not_contact_server(require_idempotent):
     client = DagsterGrpcClient(host="localhost", port=1234)
     with patch.object(client, "_get_response") as transport:
-        assert not client.cancel_executions([]).results
+        assert not client.cancel_executions([], require_idempotent=require_idempotent).results
         transport.assert_not_called()
 
 
@@ -483,3 +484,151 @@ def test_proxy_rejects_oversized_request_before_forwarding():
     with pytest.raises(grpc.RpcError):
         proxy.CancelExecutions(request, context)
     client.cancel_executions.assert_not_called()
+
+
+def test_batch_retry_keeps_first_termination_deadline():
+    with cancellation_server(["one"]) as (server, client):
+        with patch("dagster._grpc.server.time", Mock(time=Mock(side_effect=[10, 20, 30]))):
+            assert client.cancel_executions(["one"]).results["one"].success
+            assert client.cancel_executions(["one"], require_idempotent=True).results["one"].success
+            assert server._termination_times["one"] == 10  # noqa: SLF001
+            # Single-run public behavior is unchanged.
+            client.cancel_execution(CancelExecutionRequest(run_id="one"))
+            assert server._termination_times["one"] == 30  # noqa: SLF001
+
+
+def test_old_serialized_batch_reply_does_not_advertise_idempotence():
+    serialized = '{"__class__": "CancelExecutionsResult", "results": {}}'
+    assert not deserialize_value(
+        serialized, CancelExecutionsResult
+    ).termination_requests_are_idempotent
+    client = DagsterGrpcClient(host="localhost", port=1234)
+    with patch.object(
+        client,
+        "_get_response",
+        return_value=dagster_api_pb2.CancelExecutionsReply(
+            serialized_cancel_executions_result=serialized
+        ),
+    ):
+        assert not client.supports_idempotent_cancellation()
+
+
+def test_old_server_retry_does_not_reset_deadline():
+    def unimplemented(request, context):
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "old server")
+
+    with patch.object(DagsterApiServer, "CancelExecutions", side_effect=unimplemented):
+        with cancellation_server(["one", "two"]) as (server, client):
+            client.cancel_execution(CancelExecutionRequest(run_id="one"))
+            deadline = server._termination_times["one"]  # noqa: SLF001
+            with patch.object(client, "cancel_execution", wraps=client.cancel_execution) as single:
+                result = client.cancel_executions(["one", "two"], require_idempotent=True)
+            assert [call.args[0].run_id for call in single.call_args_list] == ["two"]
+            assert not result.results["one"].success
+            assert result.results["two"].success
+            assert server._termination_times["one"] == deadline  # noqa: SLF001
+
+
+def test_unimplemented_after_capability_probe_uses_safe_fallback():
+    client = DagsterGrpcClient(host="localhost", port=1234)
+    from dagster._grpc.types import CanCancelExecutionResult
+
+    with (
+        patch.object(client, "supports_idempotent_cancellation", return_value=True),
+        patch.object(
+            client, "_get_response", side_effect=RpcFailure(grpc.StatusCode.UNIMPLEMENTED)
+        ),
+        patch.object(
+            client,
+            "can_cancel_execution",
+            return_value=serialize_value(CanCancelExecutionResult(can_cancel=False)),
+        ),
+        patch.object(client, "cancel_execution") as single,
+    ):
+        response = client.cancel_executions(["one"], require_idempotent=True)
+        assert not response.results["one"].success
+        single.assert_not_called()
+
+
+def test_proxy_capability_probe_and_retry_route_to_original_generation():
+    from dagster._grpc.types import CanCancelExecutionRequest, CanCancelExecutionResult
+
+    with (
+        cancellation_server(["one"]) as (server, first),
+        cancellation_server(["two"]) as (_, second),
+    ):
+        proxy = object.__new__(DagsterProxyApiServicer)
+        proxy._run_clients = {"one": first, "two": second}
+        proxy._client = second
+        request = dagster_api_pb2.CancelExecutionsRequest(
+            serialized_cancel_executions_request=serialize_value(
+                CancelExecutionsRequest(run_ids=[])
+            )
+        )
+        reply = deserialize_value(
+            proxy.CancelExecutions(request, None).serialized_cancel_executions_result,
+            CancelExecutionsResult,
+        )
+        assert reply.termination_requests_are_idempotent
+        can_cancel = dagster_api_pb2.CanCancelExecutionRequest(
+            serialized_can_cancel_execution_request=serialize_value(
+                CanCancelExecutionRequest(run_id="one")
+            )
+        )
+        assert deserialize_value(
+            proxy.CanCancelExecution(can_cancel, None).serialized_can_cancel_execution_result,
+            CanCancelExecutionResult,
+        ).can_cancel
+        assert not server._termination_events["one"].is_set()  # noqa: SLF001
+        with patch.object(second, "supports_idempotent_cancellation", return_value=False):
+            reply = deserialize_value(
+                proxy.CancelExecutions(request, None).serialized_cancel_executions_result,
+                CancelExecutionsResult,
+            )
+            assert not reply.termination_requests_are_idempotent
+
+
+@pytest.mark.parametrize("unreachable", [False, True])
+def test_proxy_probe_ignores_unrelated_generations(unreachable):
+    proxy = object.__new__(DagsterProxyApiServicer)
+    current, old = Mock(), Mock()
+    current.supports_idempotent_cancellation.return_value = True
+    if unreachable:
+        old.supports_idempotent_cancellation.side_effect = DagsterUserCodeUnreachableError(
+            "retired generation"
+        )
+    else:
+        old.supports_idempotent_cancellation.return_value = False
+    proxy._run_clients = {"one": current, "old": old}
+    request = dagster_api_pb2.CancelExecutionsRequest(
+        serialized_cancel_executions_request=serialize_value(
+            CancelExecutionsRequest(run_ids=[], capability_run_ids=["one"])
+        )
+    )
+    response = deserialize_value(
+        proxy.CancelExecutions(request, None).serialized_cancel_executions_result,
+        CancelExecutionsResult,
+    )
+    assert response.termination_requests_are_idempotent
+    old.supports_idempotent_cancellation.assert_not_called()
+    request = dagster_api_pb2.CancelExecutionsRequest(
+        serialized_cancel_executions_request=serialize_value(CancelExecutionsRequest(run_ids=[]))
+    )
+    response = deserialize_value(
+        proxy.CancelExecutions(request, None).serialized_cancel_executions_result,
+        CancelExecutionsResult,
+    )
+    assert not response.termination_requests_are_idempotent
+
+
+def test_server_rejects_oversized_capability_probe_without_signaling():
+    with cancellation_server(["one"]) as (server, client):
+        request = dagster_api_pb2.CancelExecutionsRequest(
+            serialized_cancel_executions_request=serialize_value(
+                CancelExecutionsRequest(run_ids=[], capability_run_ids=["one"] * 501)
+            )
+        )
+        with pytest.raises(grpc.RpcError) as raised:
+            client._get_response("CancelExecutions", request)  # noqa: SLF001
+        assert raised.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert not server._termination_events["one"].is_set()  # noqa: SLF001

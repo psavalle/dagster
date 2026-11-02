@@ -1289,14 +1289,19 @@ class DagsterApiServer(DagsterApiServicer):
                 )
             )
 
-    def _cancel_execution(self, run_id: str) -> CancelExecutionResult:
+    def _cancel_execution(
+        self, run_id: str, preserve_deadline: bool = False
+    ) -> CancelExecutionResult:
         success = False
         error = None
         try:
             with self._execution_lock:
                 if run_id in self._executions:
                     self._termination_events[run_id].set()
-                    self._termination_times[run_id] = time.time()
+                    if preserve_deadline:
+                        self._termination_times.setdefault(run_id, time.time())
+                    else:
+                        self._termination_times[run_id] = time.time()
                     success = True
         except:
             error = serializable_error_info_from_exc_info(sys.exc_info())
@@ -1326,16 +1331,20 @@ class DagsterApiServer(DagsterApiServicer):
         batch = deserialize_value(
             request.serialized_cancel_executions_request, CancelExecutionsRequest
         )
-        if len(batch.run_ids) > MAX_CANCEL_EXECUTIONS_BATCH_SIZE:
+        if (
+            max(len(batch.run_ids), len(batch.capability_run_ids or []))
+            > MAX_CANCEL_EXECUTIONS_BATCH_SIZE
+        ):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT, "Too many run IDs in cancellation request"
             )
         results = {
-            run_id: self._cancel_execution(run_id) for run_id in dict.fromkeys(batch.run_ids)
+            run_id: self._cancel_execution(run_id, preserve_deadline=True)
+            for run_id in dict.fromkeys(batch.run_ids)
         }
         return dagster_api_pb2.CancelExecutionsReply(
             serialized_cancel_executions_result=serialize_value(
-                CancelExecutionsResult(results=results)
+                CancelExecutionsResult(results=results, termination_requests_are_idempotent=True)
             )
         )
 
