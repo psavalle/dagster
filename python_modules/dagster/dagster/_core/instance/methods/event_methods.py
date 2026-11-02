@@ -456,12 +456,7 @@ class EventMethods:
         return dagster_event
 
     def report_run_cancellation_batch(self, runs: Sequence["DagsterRun"]) -> None:
-        """Cancel queued runs through a storage-owned transaction where supported.
-
-        Listeners and customized reporting hooks retain the serial path. The batch backend
-        must revalidate queued status and commit run state and lifecycle events together.
-        Runs that left the queue are left for the caller's normal termination path.
-        """
+        """Cancel queued runs atomically when storage and reporting hooks support it."""
         from dagster._core.storage.dagster_run import DagsterRun
 
         check.sequence_param(runs, "runs", of_type=DagsterRun)
@@ -500,11 +495,7 @@ class EventMethods:
     def report_run_canceling_batch(
         self, runs: Sequence["DagsterRun"]
     ) -> Sequence["DagsterRun"] | None:
-        """Return atomically marked runs, or None when serial reporting is required.
-
-        Unsupported paths perform no writes. The backend must reject terminal runs and
-        changed routing metadata rather than trusting the supplied snapshots.
-        """
+        """Mark eligible runs atomically, or return None without writes when unsupported."""
         from dagster._core.storage.dagster_run import DagsterRun
 
         check.sequence_param(runs, "runs", of_type=DagsterRun)

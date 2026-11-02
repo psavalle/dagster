@@ -545,10 +545,10 @@ class PartitionBackfill(
         )
 
 
-def _retry_pending_backfill_run_terminations(instance: "DagsterInstance", backfill_id: str) -> bool:
-    # Durable SQL intents survive commit uncertainty and launcher/RPC failures. Retry each
-    # pending page once per iteration, not in the active-run loop (which would spin).
-    retried_any_runs = False
+def _retry_pending_backfill_run_terminations(
+    instance: "DagsterInstance", backfill_id: str
+) -> Exception | None:
+    first_error = None
     cursor = None
     while True:
         pending = instance.run_storage.get_runs(
@@ -562,30 +562,28 @@ def _retry_pending_backfill_run_terminations(instance: "DagsterInstance", backfi
         )
         if not pending:
             break
-        retried_any_runs = True
         cursor = pending[-1].run_id
-        instance.run_launcher.terminate_runs([run.run_id for run in pending])
-    return retried_any_runs
+        try:
+            instance.run_launcher.terminate_runs([run.run_id for run in pending])
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    return first_error
 
 
 def cancel_backfill_runs_and_cancellation_complete(
     instance: "DagsterInstance", backfill_id: str, logger: logging.Logger
 ) -> bool:
-    """Cancels all cancelable runs associated with the backfill_id. Ensures that
-    all runs for the backfill are in a terminal state before indicating that the backfill can be
-    marked CANCELED. Yields a boolean indicating the backfill can be considered canceled
-    (ie all runs are canceled).
-    """
+    """Request cancellation and return whether all backfill runs are terminal."""
     if not instance.run_coordinator:
         check.failed("The instance must have a run coordinator in order to cancel runs")
 
     canceled_any_runs = False
     retried_pending = False
+    pending_error = None
 
     while True:
-        # Cancel all cancelable runs for the backfill in batches
-
-        # start with the queued runs since those will be faster to cancel
+        # Cancel queued runs before contacting workers.
         runs_to_cancel_in_iteration = instance.run_storage.get_runs(
             filters=RunsFilter(
                 statuses=[DagsterRunStatus.QUEUED],
@@ -598,15 +596,10 @@ def cancel_backfill_runs_and_cancellation_complete(
         )
 
         if not runs_to_cancel_in_iteration:
-            # Keep queued cancellation first. Retry durable intents once, before marking
-            # new active runs, so a failed RPC neither blocks the queue nor spins here.
+            # Retry existing intents once, before marking new active runs.
             if not retried_pending:
-                canceled_any_runs = (
-                    _retry_pending_backfill_run_terminations(instance, backfill_id)
-                    or canceled_any_runs
-                )
+                pending_error = _retry_pending_backfill_run_terminations(instance, backfill_id)
                 retried_pending = True
-            # once all queued runs are canceled, cancel all other cancelable runs
             runs_to_cancel_in_iteration = instance.run_storage.get_runs(
                 filters=RunsFilter(
                     statuses=CANCELABLE_RUN_STATUSES,
@@ -622,9 +615,7 @@ def cancel_backfill_runs_and_cancellation_complete(
 
         canceled_any_runs = True
         if runs_to_cancel_in_iteration[0].status == DagsterRunStatus.QUEUED:
-            # Re-read the page immediately before reporting cancellation. Runs that left the
-            # queue since selection need launcher termination rather than queued cancellation.
-            # This does not eliminate the coordinator's existing dequeue/cancel race.
+            # Runs that left the queue require launcher termination.
             current_runs = {
                 run.run_id: run
                 for run in instance.get_runs(
@@ -651,13 +642,12 @@ def cancel_backfill_runs_and_cancellation_complete(
         if submitted_run_ids:
             instance.run_launcher.terminate_runs(submitted_run_ids)
 
+    if pending_error is not None:
+        raise pending_error
+
     if canceled_any_runs:
-        # since we are canceling some runs in this iteration, we know that there is more work to do.
-        # Either cancelling more runs, or waiting for the canceled runs to get to a terminal state
         return False
 
-    # If there are no runs to cancel, check if there are any runs still in progress. If there are,
-    # then we want to wait for them to reach a terminal state before the backfill is marked CANCELED.
     run_waiting_to_cancel = instance.get_run_ids(
         RunsFilter(
             tags={BACKFILL_ID_TAG: backfill_id},

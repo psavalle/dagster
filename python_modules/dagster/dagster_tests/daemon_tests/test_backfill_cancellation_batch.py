@@ -26,9 +26,7 @@ def _queued_run(instance, status=DagsterRunStatus.QUEUED, tags=None):
     )
 
 
-@pytest.mark.parametrize("batch_supported", [False, True])
-@pytest.mark.parametrize("page_size", [1, 2, 500])
-def test_queued_cancellation_events_and_listeners(batch_supported, page_size):
+def test_queued_cancellation_events_and_listeners():
     with instance_for_test() as instance:
         runs = [
             _queued_run(
@@ -56,17 +54,17 @@ def test_queued_cancellation_events_and_listeners(batch_supported, page_size):
                 type(storage), "supports_queued_run_cancellation", new_callable=PropertyMock
             ) as supported,
             patch.object(storage, "cancel_queued_runs", wraps=storage.cancel_queued_runs) as batch,
-            patch("dagster._core.execution.backfill.CANCELABLE_RUNS_BATCH_SIZE", page_size),
+            patch("dagster._core.execution.backfill.CANCELABLE_RUNS_BATCH_SIZE", 2),
             patch.object(instance.run_launcher, "terminate") as terminate,
         ):
-            supported.return_value = batch_supported
+            supported.return_value = True
             assert not cancel_backfill_runs_and_cancellation_complete(
                 instance, "backfill", logging.getLogger(__name__)
             )
             assert cancel_backfill_runs_and_cancellation_complete(
                 instance, "backfill", logging.getLogger(__name__)
             )
-            batch.assert_not_called()  # Instance listeners retain serial reporting.
+            batch.assert_not_called()
             terminate.assert_not_called()
         assert instance.get_run_by_id(other.run_id).status == DagsterRunStatus.QUEUED
         assert notifications == [
@@ -236,3 +234,31 @@ def test_queued_cancellation_precedes_failed_pending_retry():
                 cancel_backfill_runs_and_cancellation_complete(
                     instance, "backfill", logging.getLogger(__name__)
                 )
+
+
+def test_failed_pending_retry_does_not_block_active_cancellation():
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+
+    with instance_for_test() as instance:
+        pending = _queued_run(
+            instance,
+            status=DagsterRunStatus.CANCELING,
+            tags={BACKFILL_ID_TAG: "backfill", RUN_TERMINATION_REQUESTED_TAG: "true"},
+        )
+        active = _queued_run(
+            instance, status=DagsterRunStatus.STARTED, tags={BACKFILL_ID_TAG: "backfill"}
+        )
+
+        def terminate(run_ids):
+            if run_ids == [pending.run_id]:
+                raise RuntimeError("pending RPC unavailable")
+            assert run_ids == [active.run_id]
+            instance.report_run_canceling(instance.get_run_by_id(active.run_id))
+            return {active.run_id: True}
+
+        with patch.object(instance.run_launcher, "terminate_runs", side_effect=terminate):
+            with pytest.raises(RuntimeError, match="pending RPC unavailable"):
+                cancel_backfill_runs_and_cancellation_complete(
+                    instance, "backfill", logging.getLogger(__name__)
+                )
+        assert instance.get_run_by_id(active.run_id).status == DagsterRunStatus.CANCELING

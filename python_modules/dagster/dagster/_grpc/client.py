@@ -689,12 +689,7 @@ class DagsterGrpcClient:
     def cancel_executions(
         self, run_ids: Sequence[str], *, require_idempotent: bool = False
     ) -> CancelExecutionsResult:
-        """Cancel unique run IDs in bounded requests, retaining per-run results.
-
-        Requests may partially succeed across chunks. Uncertain transport failures are
-        propagated without replay. Older servers attempt every single-run request, even
-        when one fails, so already-prepared cancellation markers are not stranded.
-        """
+        """Cancel unique runs in bounded requests without replaying uncertain failures."""
         check.sequence_param(run_ids, "run_ids", of_type=str)
         unique_run_ids = list(dict.fromkeys(run_ids))
         results: dict[str, CancelExecutionResult] = {}
@@ -718,7 +713,7 @@ class DagsterGrpcClient:
         )
 
     def supports_idempotent_cancellation(self, run_ids: Sequence[str] = ()) -> bool:
-        """Probe with an empty request; old implementations cannot produce side effects."""
+        """Check retry safety without signaling workers."""
         check.sequence_param(run_ids, "run_ids", of_type=str)
         if len(run_ids) > MAX_CANCEL_EXECUTIONS_BATCH_SIZE:
             return all(
@@ -759,7 +754,7 @@ class DagsterGrpcClient:
                         CanCancelExecutionResult,
                     ).can_cancel
                     if not can_cancel:
-                        # Already signaled or no longer running: do not reset an old server's timer.
+                        # Do not reset an existing termination deadline.
                         results[run_id] = CancelExecutionResult(
                             success=False, message=None, serializable_error_info=None
                         )
@@ -774,8 +769,6 @@ class DagsterGrpcClient:
                     message=None,
                     serializable_error_info=serializable_error_info_from_exc_info(sys.exc_info()),
                 )
-        # The downlevel check avoids repeated signals, but is not an atomic capability
-        # guarantee and must not advertise native idempotence to proxy callers.
         return CancelExecutionsResult(results=results)
 
     def _cancel_executions(
@@ -798,7 +791,7 @@ class DagsterGrpcClient:
                 and cast("grpc.Call", error).code() == grpc.StatusCode.UNIMPLEMENTED
             ):
                 return self._cancel_executions_legacy(run_ids, check_existing=require_idempotent)
-            # Never replay a timeout or transport failure: the server may have accepted it.
+            # Transport failures may occur after the request is accepted.
             self._raise_grpc_exception(error, timeout=DEFAULT_GRPC_TIMEOUT)
         result = deserialize_value(
             response.serialized_cancel_executions_result, CancelExecutionsResult

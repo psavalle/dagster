@@ -182,8 +182,7 @@ class DefaultRunLauncher(RunLauncher, ConfigurableClass):
 
         check.sequence_param(run_ids, "run_ids", of_type=str)
         run_ids = list(dict.fromkeys(run_ids))
-        # Preserve bound-instance overrides as well as subclass customizations. In
-        # particular, custom clients may carry different authorization metadata.
+        # Custom launcher hooks may change routing or authorization.
         if any(
             getattr(getattr(self, name), "__func__", None) is not getattr(DefaultRunLauncher, name)
             for name in (
@@ -208,8 +207,7 @@ class DefaultRunLauncher(RunLauncher, ConfigurableClass):
                     )
                 }
             )
-        # The indexed intent is authoritative even if a concurrent tag writer used an
-        # older serialized run body. Only retries need this extra lookup.
+        # Indexed termination intents take precedence over serialized tags.
         canceling_ids = [
             run.run_id for run in current_runs.values() if run.status == DagsterRunStatus.CANCELING
         ]
@@ -224,6 +222,7 @@ class DefaultRunLauncher(RunLauncher, ConfigurableClass):
                     {**current_runs[run_id].tags, RUN_TERMINATION_REQUESTED_TAG: "true"}
                 )
         results = {run_id: False for run_id in run_ids}
+        first_error: Exception | None = None
         groups: dict[
             tuple[str | None, int | None, str | None, bool],
             tuple[DagsterGrpcClient, list[DagsterRun]],
@@ -234,8 +233,11 @@ class DefaultRunLauncher(RunLauncher, ConfigurableClass):
                 continue
             client = self._get_grpc_client_for_run(run)
             if client is None:
-                # Preserve existing status and diagnostic reporting for missing clients.
-                results[run_id] = self.terminate(run_id)
+                try:
+                    results[run_id] = self.terminate(run_id)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
                 continue
             key = (client.host, client.port, client.socket, client.use_ssl)
             if key not in groups:
@@ -243,96 +245,99 @@ class DefaultRunLauncher(RunLauncher, ConfigurableClass):
             groups[key][1].append(run)
 
         for client, runs in groups.values():
-            # Bound request size even for callers other than the backfill daemon.
             for offset in range(0, len(runs), MAX_CANCEL_EXECUTIONS_BATCH_SIZE):
-                candidates = runs[offset : offset + MAX_CANCEL_EXECUTIONS_BATCH_SIZE]
-                page: list[DagsterRun] = []
                 try:
-                    marked = None
-                    if self._instance.can_report_run_canceling_batch(
-                        candidates
-                    ) and client.supports_idempotent_cancellation(
-                        [run.run_id for run in candidates]
-                    ):
-                        try:
-                            marked = self._instance.report_run_canceling_batch(candidates)
-                        except BaseException:
-                            # Commit acknowledgement can be lost. Recover known durable intents;
-                            # if this read also fails, the next daemon iteration can resume them.
-                            persisted = self._instance.get_runs(
-                                RunsFilter(
-                                    run_ids=[run.run_id for run in candidates],
-                                    statuses=[DagsterRunStatus.CANCELING],
-                                    tags={RUN_TERMINATION_REQUESTED_TAG: "true"},
-                                )
-                            )
-                            expected = {
-                                run.run_id: run.tags.get(GRPC_INFO_TAG) for run in candidates
-                            }
-                            page.extend(
-                                run.with_tags({**run.tags, RUN_TERMINATION_REQUESTED_TAG: "true"})
-                                for run in persisted
-                                if run.tags.get(GRPC_INFO_TAG) == expected[run.run_id]
-                            )
-                            raise
-                    if marked is not None:
-                        page.extend(marked)
-                        marked_ids = {run.run_id for run in marked}
-                        for run in candidates:
-                            if run.run_id not in marked_ids:
-                                # Completed or moved to another code server while we prepared.
-                                results[run.run_id] = self.terminate(run.run_id)
-                    else:
-                        for run in runs[offset : offset + MAX_CANCEL_EXECUTIONS_BATCH_SIZE]:
-                            # Metadata is loaded in bulk, but preserve the single-run path's fresh
-                            # terminal check immediately before reporting cancellation.
-                            current = self._instance.get_run_by_id(run.run_id)
-                            if not current or current.is_finished:
-                                continue
-                            if current.tags.get(GRPC_INFO_TAG) != run.tags.get(GRPC_INFO_TAG):
-                                results[run.run_id] = self.terminate(run.run_id)
-                                continue
-                            if (
-                                current.status == DagsterRunStatus.CANCELING
-                                and run.tags.get(RUN_TERMINATION_REQUESTED_TAG) == "true"
-                            ):
-                                page.append(
-                                    current.with_tags(
-                                        {**current.tags, RUN_TERMINATION_REQUESTED_TAG: "true"}
-                                    )
-                                )
-                                continue
-                            try:
-                                self._instance.report_run_canceling(current)
-                            except BaseException:
-                                # Reporting can fail after persisting CANCELING (for example,
-                                # in a listener). Include that run in the first-send drain too.
-                                latest = self._instance.get_run_by_id(current.run_id)
-                                if latest and latest.status == DagsterRunStatus.CANCELING:
-                                    page.append(latest)
-                                raise
-                            else:
-                                page.append(current)
-
-                finally:
-                    # A later preparation failure must not leave earlier runs CANCELING
-                    # without ever sending their requests. This is a first send, not a retry.
-                    if page:
-                        response = client.cancel_executions(
-                            [run.run_id for run in page],
-                            require_idempotent=any(
-                                run.tags.get(RUN_TERMINATION_REQUESTED_TAG) == "true"
-                                for run in page
-                            ),
-                        )
-                        for run in page:
-                            result = response.results[run.run_id]
-                            if result.serializable_error_info:
-                                raise DagsterUserCodeProcessError.from_error_info(
-                                    result.serializable_error_info
-                                )
-                            results[run.run_id] = result.success
+                    self._terminate_runs_page(
+                        client, runs[offset : offset + MAX_CANCEL_EXECUTIONS_BATCH_SIZE], results
+                    )
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
         return results
+
+    def _terminate_runs_page(
+        self,
+        client: "DagsterGrpcClient",
+        candidates: Sequence[DagsterRun],
+        results: dict[str, bool],
+    ) -> None:
+        page: list[DagsterRun] = []
+        try:
+            marked = None
+            if self._instance.can_report_run_canceling_batch(
+                candidates
+            ) and client.supports_idempotent_cancellation([run.run_id for run in candidates]):
+                try:
+                    marked = self._instance.report_run_canceling_batch(candidates)
+                except BaseException:
+                    # Recover committed intents after an uncertain write.
+                    persisted = self._instance.get_runs(
+                        RunsFilter(
+                            run_ids=[run.run_id for run in candidates],
+                            statuses=[DagsterRunStatus.CANCELING],
+                            tags={RUN_TERMINATION_REQUESTED_TAG: "true"},
+                        )
+                    )
+                    expected = {run.run_id: run.tags.get(GRPC_INFO_TAG) for run in candidates}
+                    page.extend(
+                        run.with_tags({**run.tags, RUN_TERMINATION_REQUESTED_TAG: "true"})
+                        for run in persisted
+                        if run.tags.get(GRPC_INFO_TAG) == expected[run.run_id]
+                    )
+                    raise
+            if marked is not None:
+                page.extend(marked)
+                marked_ids = {run.run_id for run in marked}
+                for run in candidates:
+                    if run.run_id not in marked_ids:
+                        results[run.run_id] = self.terminate(run.run_id)
+            else:
+                for run in candidates:
+                    current = self._instance.get_run_by_id(run.run_id)
+                    if not current or current.is_finished:
+                        continue
+                    if current.tags.get(GRPC_INFO_TAG) != run.tags.get(GRPC_INFO_TAG):
+                        results[run.run_id] = self.terminate(run.run_id)
+                        continue
+                    if (
+                        current.status == DagsterRunStatus.CANCELING
+                        and run.tags.get(RUN_TERMINATION_REQUESTED_TAG) == "true"
+                    ):
+                        page.append(
+                            current.with_tags(
+                                {**current.tags, RUN_TERMINATION_REQUESTED_TAG: "true"}
+                            )
+                        )
+                        continue
+                    try:
+                        self._instance.report_run_canceling(current)
+                    except BaseException:
+                        # A listener can fail after persisting CANCELING.
+                        latest = self._instance.get_run_by_id(current.run_id)
+                        if latest and latest.status == DagsterRunStatus.CANCELING:
+                            page.append(latest)
+                        raise
+                    else:
+                        page.append(current)
+
+        finally:
+            # Dispatch prepared runs even if preparation fails.
+            if page:
+                response = client.cancel_executions(
+                    [run.run_id for run in page],
+                    require_idempotent=any(
+                        run.tags.get(RUN_TERMINATION_REQUESTED_TAG) == "true" for run in page
+                    ),
+                )
+                for run in page:
+                    result = response.results[run.run_id]
+                    if result.serializable_error_info:
+                        raise DagsterUserCodeProcessError.from_error_info(
+                            result.serializable_error_info
+                        )
+                    results[run.run_id] = result.success
 
     def join(self, timeout=30):
         # If this hasn't been initialized at all, we can just do a noop

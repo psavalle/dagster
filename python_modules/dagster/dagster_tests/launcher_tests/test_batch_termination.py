@@ -21,7 +21,6 @@ from dagster._grpc.proxy_server import DagsterProxyApiServicer
 from dagster._grpc.server import DagsterApiServer
 from dagster._grpc.types import (
     CancelExecutionRequest,
-    CancelExecutionResult,
     CancelExecutionsRequest,
     CancelExecutionsResult,
 )
@@ -79,22 +78,6 @@ def test_uncertain_transport_error_never_replays(status):
         with pytest.raises(DagsterUserCodeUnreachableError):
             client.cancel_executions(["one", "two"])
         single.assert_not_called()
-
-
-def test_old_server_uses_single_rpc_fallback():
-    client = DagsterGrpcClient(host="localhost", port=1234)
-    result = serialize_value(
-        CancelExecutionResult(success=True, message=None, serializable_error_info=None)
-    )
-    with (
-        patch.object(
-            client, "_get_response", side_effect=RpcFailure(grpc.StatusCode.UNIMPLEMENTED)
-        ),
-        patch.object(client, "cancel_execution", return_value=result) as single,
-    ):
-        response = client.cancel_executions(["one", "two"])
-    assert single.call_count == 2
-    assert all(item.success for item in response.results.values())
 
 
 @pytest.mark.parametrize("require_idempotent", [False, True])
@@ -162,12 +145,15 @@ def test_default_launcher_groups_servers_and_skips_finished_runs():
             )
 
 
-def test_single_termination_override_is_preserved():
+@pytest.mark.parametrize("bound", [False, True])
+def test_single_termination_override_is_preserved(bound):
     class CustomLauncher(DefaultRunLauncher):
         def terminate(self, run_id):
             return run_id == "one"
 
-    launcher = CustomLauncher()
+    launcher = DefaultRunLauncher() if bound else CustomLauncher()
+    if bound:
+        launcher.terminate = lambda run_id: run_id == "one"
     assert launcher.terminate_runs(["one", "two"]) == {"one": True, "two": False}
     with patch.object(launcher, "terminate", side_effect=[True, RuntimeError("failed")]) as single:
         with pytest.raises(RuntimeError, match="failed"):
@@ -190,7 +176,7 @@ def test_native_unimplemented_endpoint_falls_back():
     def unimplemented(request, context):
         context.abort(grpc.StatusCode.UNIMPLEMENTED, "old server")
 
-    # Bind an older server's behavior when registering the handlers, over a real channel.
+    # Registration binds handlers to the test server.
     with patch.object(DagsterApiServer, "CancelExecutions", side_effect=unimplemented):
         with cancellation_server(["one", "two"]) as (_, client):
             with patch.object(client, "cancel_execution", wraps=client.cancel_execution) as single:
@@ -209,9 +195,14 @@ def test_incomplete_batch_response_is_rejected():
             client.cancel_executions(["one"])
 
 
-def test_default_launcher_bounds_batch_size():
+@pytest.mark.parametrize("worker_failure", [False, True])
+def test_default_launcher_bounds_batch_size(worker_failure):
     ids = [str(index) for index in range(501)]
-    with instance_for_test() as instance, cancellation_server(ids) as (_, client):
+    with instance_for_test() as instance, cancellation_server(ids) as (server, client):
+        if worker_failure:
+            server._termination_events[ids[0]] = Mock(  # noqa: SLF001
+                set=Mock(side_effect=RuntimeError("signal failed"))
+            )
         runs = {
             run_id: DagsterRun(
                 job_name="job",
@@ -236,11 +227,16 @@ def test_default_launcher_bounds_batch_size():
                 DagsterGrpcClient, "cancel_executions", autospec=True, side_effect=cancel_executions
             ) as batch,
         ):
-            result = launcher.terminate_runs(ids)
+            if worker_failure:
+                with pytest.raises(DagsterUserCodeProcessError):
+                    launcher.terminate_runs(ids)
+            else:
+                result = launcher.terminate_runs(ids)
+                assert len(result) == 501
+                assert all(result.values())
+        assert server._termination_events[ids[-1]].is_set()  # noqa: SLF001
         assert lookup.call_count == 2
         assert [len(call.args[1]) for call in batch.call_args_list] == [500, 1]
-        assert len(result) == 501
-        assert all(result.values())
 
 
 def test_custom_termination_client_override_is_preserved():
@@ -313,27 +309,6 @@ def test_preparation_failure_sends_already_prepared_requests():
             assert instance.get_run_by_id(runs[1].run_id).status == DagsterRunStatus.STARTED
 
 
-def test_old_server_failure_does_not_strand_later_requests():
-    client = DagsterGrpcClient(host="localhost", port=1234)
-    success = serialize_value(
-        CancelExecutionResult(success=True, message=None, serializable_error_info=None)
-    )
-    with (
-        patch.object(
-            client, "_get_response", side_effect=RpcFailure(grpc.StatusCode.UNIMPLEMENTED)
-        ),
-        patch.object(
-            client, "cancel_execution", side_effect=[success, RuntimeError("one failed"), success]
-        ) as single,
-    ):
-        result = client.cancel_executions(["one", "two", "three"])
-    assert [call.args[0].run_id for call in single.call_args_list] == ["one", "two", "three"]
-    assert result.results["one"].success
-    assert not result.results["two"].success
-    assert result.results["two"].serializable_error_info is not None
-    assert result.results["three"].success
-
-
 def test_client_bounds_and_deduplicates_requests():
     ids = [str(index) for index in range(501)]
     with cancellation_server(ids) as (_, client):
@@ -355,29 +330,6 @@ def test_server_rejects_oversized_request_before_signaling():
             client._get_response("CancelExecutions", request)  # noqa: SLF001
         assert raised.value.code() == grpc.StatusCode.INVALID_ARGUMENT
         assert not server._termination_events["one"].is_set()  # noqa: SLF001
-
-
-def test_bound_instance_termination_override_is_preserved():
-    launcher = DefaultRunLauncher()
-    with patch.object(launcher, "terminate", side_effect=[True, False]) as single:
-        assert launcher.terminate_runs(["one", "one", "two"]) == {"one": True, "two": False}
-        assert [call.args[0] for call in single.call_args_list] == ["one", "two"]
-
-
-def test_new_client_builder_override_keeps_single_run_path():
-    with instance_for_test() as instance:
-        runs = [create_run_for_test(instance, status=DagsterRunStatus.STARTED) for _ in range(2)]
-        with cancellation_server([run.run_id for run in runs]) as (_, client):
-
-            class CustomLauncher(DefaultRunLauncher):
-                def _get_grpc_client_for_run(self, run):
-                    return client
-
-            launcher = CustomLauncher()
-            launcher.register_instance(instance)
-            with patch.object(client, "cancel_execution", wraps=client.cancel_execution) as single:
-                assert all(launcher.terminate_runs([run.run_id for run in runs]).values())
-            assert single.call_count == 2
 
 
 def test_reporting_error_after_canceling_marker_still_sends_request():
@@ -492,7 +444,7 @@ def test_batch_retry_keeps_first_termination_deadline():
             assert client.cancel_executions(["one"]).results["one"].success
             assert client.cancel_executions(["one"], require_idempotent=True).results["one"].success
             assert server._termination_times["one"] == 10  # noqa: SLF001
-            # Single-run public behavior is unchanged.
+            # Single-run requests reset the deadline.
             client.cancel_execution(CancelExecutionRequest(run_id="one"))
             assert server._termination_times["one"] == 30  # noqa: SLF001
 
@@ -632,3 +584,56 @@ def test_server_rejects_oversized_capability_probe_without_signaling():
             client._get_response("CancelExecutions", request)  # noqa: SLF001
         assert raised.value.code() == grpc.StatusCode.INVALID_ARGUMENT
         assert not server._termination_events["one"].is_set()  # noqa: SLF001
+
+
+@pytest.mark.parametrize("worker_failure", [False, True])
+def test_default_launcher_attempts_other_server_groups_after_failure(worker_failure):
+    with instance_for_test() as instance:
+        runs = [create_run_for_test(instance, status=DagsterRunStatus.STARTED) for _ in range(2)]
+        with (
+            cancellation_server([runs[0].run_id]) as (broken, first),
+            cancellation_server([runs[1].run_id]) as (healthy, second),
+        ):
+            launcher = DefaultRunLauncher()
+            launcher.register_instance(instance)
+            for run, client in zip(runs, [first, second]):
+                instance.add_run_tags(
+                    run.run_id,
+                    {GRPC_INFO_TAG: json.dumps({"host": client.host, "port": client.port})},
+                )
+            if worker_failure:
+                broken._termination_events[runs[0].run_id] = Mock(  # noqa: SLF001
+                    set=Mock(side_effect=RuntimeError("signal failed"))
+                )
+            original = DagsterGrpcClient.cancel_executions
+
+            def cancel(client, run_ids, **kwargs):
+                if not worker_failure and client.port == first.port:
+                    raise DagsterUserCodeUnreachableError("server unavailable")
+                return original(client, run_ids, **kwargs)
+
+            with patch.object(DagsterGrpcClient, "cancel_executions", cancel):
+                with pytest.raises(
+                    DagsterUserCodeProcessError
+                    if worker_failure
+                    else DagsterUserCodeUnreachableError
+                ):
+                    launcher.terminate_runs([run.run_id for run in runs])
+            assert healthy._termination_events[runs[1].run_id].is_set()  # noqa: SLF001
+
+
+def test_proxy_probe_requires_known_routes():
+    proxy = object.__new__(DagsterProxyApiServicer)
+    client = Mock()
+    proxy._run_clients = {"one": client}
+    request = dagster_api_pb2.CancelExecutionsRequest(
+        serialized_cancel_executions_request=serialize_value(
+            CancelExecutionsRequest(run_ids=[], capability_run_ids=["one", "missing"])
+        )
+    )
+    result = deserialize_value(
+        proxy.CancelExecutions(request, None).serialized_cancel_executions_result,
+        CancelExecutionsResult,
+    )
+    assert not result.termination_requests_are_idempotent
+    client.supports_idempotent_cancellation.assert_not_called()

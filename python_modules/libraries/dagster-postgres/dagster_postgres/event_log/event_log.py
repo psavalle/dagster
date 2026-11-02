@@ -240,8 +240,7 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
 
     @property
     def _supports_cancellation_transactions(self) -> bool:
-        # Cross-store atomicity is only possible for the stock stores sharing one database.
-        # Extensions must explicitly implement/opt into the new cancellation contract.
+        # The transaction requires stock run/event stores in one database.
         from dagster_postgres.run_storage import PostgresRunStorage
 
         if not self.has_instance:
@@ -291,6 +290,23 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
         cancel_queued = target_status == DagsterRunStatus.CANCELED
         has_end_time = cancel_queued and run_storage.has_run_stats_index_cols()
         allowed = [DagsterRunStatus.QUEUED] if cancel_queued else NOT_FINISHED_STATUSES
+        event_specs = [
+            (
+                DagsterEventType.RUN_CANCELING,
+                "Canceling run from the queue."
+                if cancel_queued
+                else "Sending run termination request.",
+                logging.INFO,
+            )
+        ]
+        if cancel_queued:
+            event_specs.append(
+                (
+                    DagsterEventType.RUN_CANCELED,
+                    "This run has been marked as canceled from outside the execution context.",
+                    logging.ERROR,
+                )
+            )
         marked: list[DagsterRun] = []
         with self._connect() as connection:
             conn = connection.execution_options(isolation_level="READ COMMITTED")
@@ -353,23 +369,6 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
                         updated = run.with_status(target_status)
                         marked.append(updated)
                         run_bodies[run.run_id] = serialize_value(updated)
-                        event_specs = [
-                            (
-                                DagsterEventType.RUN_CANCELING,
-                                "Canceling run from the queue."
-                                if cancel_queued
-                                else "Sending run termination request.",
-                                logging.INFO,
-                            )
-                        ]
-                        if cancel_queued:
-                            event_specs.append(
-                                (
-                                    DagsterEventType.RUN_CANCELED,
-                                    "This run has been marked as canceled from outside the execution context.",
-                                    logging.ERROR,
-                                )
-                            )
                         for event_type, message, level in event_specs:
                             events.append(
                                 EventLogEntry(
