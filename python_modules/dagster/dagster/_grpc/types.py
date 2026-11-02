@@ -503,12 +503,15 @@ MAX_CANCEL_EXECUTIONS_BATCH_SIZE = 500
 @record
 class CancelExecutionsRequest:
     run_ids: Sequence[str]
+    require_idempotent: bool = False
+    capability_run_ids: Sequence[str] | None = None
 
 
 @whitelist_for_serdes
 @record
 class CancelExecutionsResult:
     results: Mapping[str, CancelExecutionResult]
+    termination_requests_are_idempotent: bool = False
 
 
 @whitelist_for_serdes

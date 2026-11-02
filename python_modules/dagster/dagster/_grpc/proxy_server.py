@@ -23,6 +23,8 @@ from dagster._grpc.client import (
 from dagster._grpc.constants import GrpcServerCommand
 from dagster._grpc.types import (
     MAX_CANCEL_EXECUTIONS_BATCH_SIZE,
+    CanCancelExecutionRequest,
+    CanCancelExecutionResult,
     CancelExecutionRequest,
     CancelExecutionResult,
     CancelExecutionsRequest,
@@ -418,9 +420,38 @@ class DagsterProxyApiServicer(DagsterApiServicer):
         batch = deserialize_value(
             request.serialized_cancel_executions_request, CancelExecutionsRequest
         )
-        if len(batch.run_ids) > MAX_CANCEL_EXECUTIONS_BATCH_SIZE:
+        if (
+            max(len(batch.run_ids), len(batch.capability_run_ids or []))
+            > MAX_CANCEL_EXECUTIONS_BATCH_SIZE
+        ):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT, "Too many run IDs in cancellation request"
+            )
+        if not batch.run_ids:
+            # Probe only the requested generations, not unrelated or retired servers.
+            clients = (
+                {
+                    self._run_clients[run_id]
+                    for run_id in batch.capability_run_ids
+                    if run_id in self._run_clients
+                }
+                if batch.capability_run_ids is not None
+                else set(self._run_clients.values())
+            )
+            supported = bool(clients)
+            try:
+                for client in clients:
+                    supported = supported and client.supports_idempotent_cancellation()
+            except Exception:
+                # Capability discovery has no side effects. An unreachable generation
+                # disables SQL batching; actual cancellation retains per-run errors.
+                supported = False
+            return dagster_api_pb2.CancelExecutionsReply(
+                serialized_cancel_executions_result=serialize_value(
+                    CancelExecutionsResult(
+                        results={}, termination_requests_are_idempotent=supported
+                    )
+                )
             )
         # A proxy can retain runs from several code-server generations after a reload.
         # Route each run to its original server rather than the current server.
@@ -441,10 +472,16 @@ class DagsterProxyApiServicer(DagsterApiServicer):
                     )
             else:
                 by_client.setdefault(client, []).append(run_id)
+        idempotent = True
         for client, run_ids in by_client.items():
             try:
-                results.update(client.cancel_executions(run_ids).results)
+                reply = client.cancel_executions(
+                    run_ids, require_idempotent=batch.require_idempotent
+                )
+                results.update(reply.results)
+                idempotent = idempotent and reply.termination_requests_are_idempotent
             except Exception:
+                idempotent = False
                 error = serializable_error_info_from_exc_info(sys.exc_info())
                 for run_id in run_ids:
                     results[run_id] = CancelExecutionResult(
@@ -452,12 +489,24 @@ class DagsterProxyApiServicer(DagsterApiServicer):
                     )
         return dagster_api_pb2.CancelExecutionsReply(
             serialized_cancel_executions_result=serialize_value(
-                CancelExecutionsResult(results=results)
+                CancelExecutionsResult(
+                    results=results, termination_requests_are_idempotent=idempotent
+                )
             )
         )
 
     def CanCancelExecution(self, request, context):
-        return self._query("CanCancelExecution", request, context)
+        args = deserialize_value(
+            request.serialized_can_cancel_execution_request, CanCancelExecutionRequest
+        )
+        client = self._run_clients.get(args.run_id)
+        if client is None:
+            return dagster_api_pb2.CanCancelExecutionReply(
+                serialized_can_cancel_execution_result=serialize_value(
+                    CanCancelExecutionResult(can_cancel=False)
+                )
+            )
+        return client._get_response("CanCancelExecution", request)  # noqa: SLF001
 
     def StartRun(self, request, context):
         if self._shutdown_once_executions_finish_event.is_set():
