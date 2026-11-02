@@ -1,6 +1,6 @@
 import logging
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -37,6 +37,7 @@ from dagster._utils.error import SerializableErrorInfo
 
 if TYPE_CHECKING:
     from dagster._core.instance import DagsterInstance
+    from dagster._core.storage.dagster_run import DagsterRun
 
 CANCELABLE_RUNS_BATCH_SIZE = int(os.getenv("DAGSTER_BACKFILL_CANCEL_RUNS_BATCH_SIZE", "500"))
 
@@ -545,116 +546,84 @@ class PartitionBackfill(
         )
 
 
-def _retry_pending_backfill_run_terminations(
-    instance: "DagsterInstance", backfill_id: str
-) -> Exception | None:
-    first_error = None
+def _get_backfill_run_batches(
+    instance: "DagsterInstance", filters: RunsFilter
+) -> Iterator[Sequence["DagsterRun"]]:
     cursor = None
     while True:
-        pending = instance.run_storage.get_runs(
-            RunsFilter(
-                statuses=[DagsterRunStatus.CANCELING],
-                tags={BACKFILL_ID_TAG: backfill_id, RUN_TERMINATION_REQUESTED_TAG: "true"},
-            ),
+        runs = instance.run_storage.get_runs(
+            filters=filters,
             cursor=cursor,
             limit=CANCELABLE_RUNS_BATCH_SIZE,
             ascending=True,
         )
-        if not pending:
-            break
-        cursor = pending[-1].run_id
-        try:
-            instance.run_launcher.terminate_runs([run.run_id for run in pending])
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
-    return first_error
+        if not runs:
+            return
+        cursor = runs[-1].run_id
+        yield runs
 
 
 def cancel_backfill_runs_and_cancellation_complete(
     instance: "DagsterInstance", backfill_id: str, logger: logging.Logger
 ) -> bool:
-    """Request cancellation and return whether all backfill runs are terminal."""
+    """Cancel each page once and wait for all backfill runs to become terminal."""
     if not instance.run_coordinator:
         check.failed("The instance must have a run coordinator in order to cancel runs")
 
-    canceled_any_runs = False
-    retried_pending = False
-    pending_error = None
-
-    while True:
-        # Cancel queued runs before contacting workers.
-        runs_to_cancel_in_iteration = instance.run_storage.get_runs(
-            filters=RunsFilter(
-                statuses=[DagsterRunStatus.QUEUED],
-                tags={
-                    BACKFILL_ID_TAG: backfill_id,
-                },
-            ),
-            limit=CANCELABLE_RUNS_BATCH_SIZE,
-            ascending=True,
+    tags = {BACKFILL_ID_TAG: backfill_id}
+    phases = [RunsFilter(statuses=[DagsterRunStatus.QUEUED], tags=tags)]
+    phases.append(
+        RunsFilter(
+            statuses=[DagsterRunStatus.CANCELING],
+            tags={**tags, RUN_TERMINATION_REQUESTED_TAG: "true"},
         )
-
-        if not runs_to_cancel_in_iteration:
-            # Retry existing intents once, before marking new active runs.
-            if not retried_pending:
-                pending_error = _retry_pending_backfill_run_terminations(instance, backfill_id)
-                retried_pending = True
-            runs_to_cancel_in_iteration = instance.run_storage.get_runs(
-                filters=RunsFilter(
-                    statuses=CANCELABLE_RUN_STATUSES,
-                    tags={
-                        BACKFILL_ID_TAG: backfill_id,
-                    },
-                ),
-                limit=CANCELABLE_RUNS_BATCH_SIZE,
-                ascending=True,
-            )
-            if not runs_to_cancel_in_iteration:
-                break
-
-        canceled_any_runs = True
-        if runs_to_cancel_in_iteration[0].status == DagsterRunStatus.QUEUED:
-            # Runs that left the queue require launcher termination.
-            current_runs = {
-                run.run_id: run
-                for run in instance.get_runs(
-                    RunsFilter(run_ids=[run.run_id for run in runs_to_cancel_in_iteration])
-                )
-            }
-            runs_to_cancel_in_iteration = [
-                current_runs[run.run_id]
-                for run in runs_to_cancel_in_iteration
-                if run.run_id in current_runs
-            ]
-            queued_runs = [
-                run for run in runs_to_cancel_in_iteration if run.status == DagsterRunStatus.QUEUED
-            ]
-            for run in queued_runs:
-                logger.info(f"Canceling queued run {run.run_id}")
-            instance.report_run_cancellation_batch(queued_runs)
-
-        submitted_run_ids = [
-            run.run_id
-            for run in runs_to_cancel_in_iteration
-            if run.status != DagsterRunStatus.QUEUED and run.status in CANCELABLE_RUN_STATUSES
-        ]
-        if submitted_run_ids:
-            instance.run_launcher.terminate_runs(submitted_run_ids)
-
-    if pending_error is not None:
-        raise pending_error
-
+    )
+    phases.append(
+        RunsFilter(
+            statuses=[
+                status for status in CANCELABLE_RUN_STATUSES if status != DagsterRunStatus.QUEUED
+            ],
+            tags=tags,
+        )
+    )
+    canceled_any_runs = False
+    first_error: Exception | None = None
+    submitted_from_queue: set[str] = set()
+    for filters in phases:
+        for batch in _get_backfill_run_batches(instance, filters):
+            canceled_any_runs = True
+            runs = batch
+            try:
+                if filters.statuses == [DagsterRunStatus.QUEUED]:
+                    # Revalidate queued state before reporting cancellation.
+                    current = {
+                        run.run_id: run
+                        for run in instance.get_runs(
+                            RunsFilter(run_ids=[run.run_id for run in batch])
+                        )
+                    }
+                    runs = [current[run.run_id] for run in batch if run.run_id in current]
+                    queued_runs = [run for run in runs if run.status == DagsterRunStatus.QUEUED]
+                    for run in queued_runs:
+                        logger.info(f"Canceling queued run {run.run_id}")
+                    instance.report_run_cancellation_batch(queued_runs)
+                    run_ids = [
+                        run.run_id
+                        for run in runs
+                        if run.status != DagsterRunStatus.QUEUED
+                        and run.status in CANCELABLE_RUN_STATUSES
+                    ]
+                    submitted_from_queue.update(run_ids)
+                else:
+                    # Queue-raced runs already had their termination attempt this pass.
+                    run_ids = [run.run_id for run in runs if run.run_id not in submitted_from_queue]
+                if run_ids:
+                    instance.run_launcher.terminate_runs(run_ids)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
     if canceled_any_runs:
         return False
-
-    run_waiting_to_cancel = instance.get_run_ids(
-        RunsFilter(
-            tags={BACKFILL_ID_TAG: backfill_id},
-            statuses=NOT_FINISHED_STATUSES,
-        ),
-        limit=1,
-    )
-    work_done = len(run_waiting_to_cancel) == 0
-
-    return work_done
+    return not instance.get_run_ids(RunsFilter(tags=tags, statuses=NOT_FINISHED_STATUSES), limit=1)
