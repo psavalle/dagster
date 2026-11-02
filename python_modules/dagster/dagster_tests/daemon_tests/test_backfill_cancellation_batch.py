@@ -179,3 +179,14 @@ def test_custom_reporting_hooks_retain_serial_path(method):
             batch.assert_not_called()
             assert hook.called
         assert instance.get_run_by_id(run.run_id).status == DagsterRunStatus.CANCELED
+
+
+def test_queued_cancellation_filter_does_not_repeat_page():
+    with instance_for_test() as instance:
+        run = _queued_run(instance, tags={BACKFILL_ID_TAG: "backfill"})
+        with patch.object(instance, "should_store_event", return_value=False) as filtered:
+            assert not cancel_backfill_runs_and_cancellation_complete(
+                instance, "backfill", logging.getLogger(__name__)
+            )
+            assert filtered.call_count == 2
+        assert instance.get_run_by_id(run.run_id).status == DagsterRunStatus.QUEUED
