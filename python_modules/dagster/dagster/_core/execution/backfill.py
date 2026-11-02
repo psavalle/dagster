@@ -561,6 +561,8 @@ def _get_backfill_run_batches(
             return
         cursor = runs[-1].run_id
         yield runs
+        if len(runs) < CANCELABLE_RUNS_BATCH_SIZE:
+            return
 
 
 def cancel_backfill_runs_and_cancellation_complete(
