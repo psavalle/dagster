@@ -5,6 +5,7 @@ import time
 from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
+import grpc
 from dagster_shared.serdes.objects.models.defs_state_info import DefsStateInfo
 
 import dagster._check as check
@@ -21,15 +22,20 @@ from dagster._grpc.client import (
 )
 from dagster._grpc.constants import GrpcServerCommand
 from dagster._grpc.types import (
+    MAX_CANCEL_EXECUTIONS_BATCH_SIZE,
+    CanCancelExecutionRequest,
+    CanCancelExecutionResult,
     CancelExecutionRequest,
     CancelExecutionResult,
+    CancelExecutionsRequest,
+    CancelExecutionsResult,
     ExecuteExternalJobArgs,
     SensorExecutionArgs,
     ShutdownServerResult,
     StartRunResult,
 )
 from dagster._serdes import deserialize_value, serialize_value
-from dagster._utils.error import serializable_error_info_from_exc_info
+from dagster._utils.error import SerializableErrorInfo, serializable_error_info_from_exc_info
 
 if TYPE_CHECKING:
     from dagster._grpc.client import DagsterGrpcClient
@@ -410,8 +416,93 @@ class DagsterProxyApiServicer(DagsterApiServicer):
                 )
             )
 
+    def CancelExecutions(self, request, context):
+        batch = deserialize_value(
+            request.serialized_cancel_executions_request, CancelExecutionsRequest
+        )
+        if (
+            max(len(batch.run_ids), len(batch.capability_run_ids or []))
+            > MAX_CANCEL_EXECUTIONS_BATCH_SIZE
+        ):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "Too many run IDs in cancellation request"
+            )
+        if not batch.run_ids:
+            run_ids = (
+                batch.capability_run_ids
+                if batch.capability_run_ids is not None
+                else self._run_clients
+            )
+            clients = {
+                self._run_clients[run_id] for run_id in run_ids if run_id in self._run_clients
+            }
+            try:
+                supported = (
+                    bool(clients)
+                    and all(run_id in self._run_clients for run_id in run_ids)
+                    and all(client.supports_idempotent_cancellation() for client in clients)
+                )
+            except Exception:
+                supported = False
+            return dagster_api_pb2.CancelExecutionsReply(
+                serialized_cancel_executions_result=serialize_value(
+                    CancelExecutionsResult(
+                        results={}, termination_requests_are_idempotent=supported
+                    )
+                )
+            )
+        # Each run belongs to its original code-server generation.
+        by_client: dict[DagsterGrpcClient, list[str]] = {}
+        results: dict[str, CancelExecutionResult] = {}
+        for run_id in dict.fromkeys(batch.run_ids):
+            client = self._run_clients.get(run_id)
+            if client is None:
+                results[run_id] = CancelExecutionResult(
+                    success=False,
+                    message=None,
+                    serializable_error_info=SerializableErrorInfo(
+                        message=f"Could not find a server for run {run_id}",
+                        stack=[],
+                        cls_name="Exception",
+                    ),
+                )
+            else:
+                by_client.setdefault(client, []).append(run_id)
+        idempotent = True
+        for client, run_ids in by_client.items():
+            try:
+                reply = client.cancel_executions(
+                    run_ids, require_idempotent=batch.require_idempotent
+                )
+                results.update(reply.results)
+                idempotent = idempotent and reply.termination_requests_are_idempotent
+            except Exception:
+                idempotent = False
+                error = serializable_error_info_from_exc_info(sys.exc_info())
+                for run_id in run_ids:
+                    results[run_id] = CancelExecutionResult(
+                        success=False, message=None, serializable_error_info=error
+                    )
+        return dagster_api_pb2.CancelExecutionsReply(
+            serialized_cancel_executions_result=serialize_value(
+                CancelExecutionsResult(
+                    results=results, termination_requests_are_idempotent=idempotent
+                )
+            )
+        )
+
     def CanCancelExecution(self, request, context):
-        return self._query("CanCancelExecution", request, context)
+        args = deserialize_value(
+            request.serialized_can_cancel_execution_request, CanCancelExecutionRequest
+        )
+        client = self._run_clients.get(args.run_id)
+        if client is None:
+            return dagster_api_pb2.CanCancelExecutionReply(
+                serialized_can_cancel_execution_result=serialize_value(
+                    CanCancelExecutionResult(can_cancel=False)
+                )
+            )
+        return client._get_response("CanCancelExecution", request)  # noqa: SLF001
 
     def StartRun(self, request, context):
         if self._shutdown_once_executions_finish_event.is_set():

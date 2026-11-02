@@ -20,8 +20,13 @@ from dagster._core.types.loadable_target_origin import LoadableTargetOrigin
 from dagster._grpc.__generated__ import DagsterApiStub, dagster_api_pb2
 from dagster._grpc.server import GrpcServerProcess
 from dagster._grpc.types import (
+    MAX_CANCEL_EXECUTIONS_BATCH_SIZE,
     CanCancelExecutionRequest,
+    CanCancelExecutionResult,
     CancelExecutionRequest,
+    CancelExecutionResult,
+    CancelExecutionsRequest,
+    CancelExecutionsResult,
     ExecuteExternalJobArgs,
     ExecutionPlanSnapshotArgs,
     ExternalScheduleExecutionArgs,
@@ -39,7 +44,7 @@ from dagster._grpc.utils import (
     max_rx_bytes,
     max_send_bytes,
 )
-from dagster._serdes import serialize_value
+from dagster._serdes import deserialize_value, serialize_value
 from dagster._utils.error import serializable_error_info_from_exc_info
 
 CLIENT_HEARTBEAT_INTERVAL = 1
@@ -680,6 +685,121 @@ class DagsterGrpcClient:
         )
 
         return res.serialized_cancel_execution_result
+
+    def cancel_executions(
+        self, run_ids: Sequence[str], *, require_idempotent: bool = False
+    ) -> CancelExecutionsResult:
+        """Cancel unique runs in bounded requests without replaying uncertain failures."""
+        check.sequence_param(run_ids, "run_ids", of_type=str)
+        unique_run_ids = list(dict.fromkeys(run_ids))
+        results: dict[str, CancelExecutionResult] = {}
+        idempotent = True
+        use_legacy = (
+            bool(unique_run_ids)
+            and require_idempotent
+            and not self.supports_idempotent_cancellation(unique_run_ids)
+        )
+        for offset in range(0, len(unique_run_ids), MAX_CANCEL_EXECUTIONS_BATCH_SIZE):
+            chunk = unique_run_ids[offset : offset + MAX_CANCEL_EXECUTIONS_BATCH_SIZE]
+            reply = (
+                self._cancel_executions_legacy(chunk, check_existing=True)
+                if use_legacy
+                else self._cancel_executions(chunk, require_idempotent=require_idempotent)
+            )
+            results.update(reply.results)
+            idempotent = idempotent and reply.termination_requests_are_idempotent
+        return CancelExecutionsResult(
+            results=results, termination_requests_are_idempotent=idempotent
+        )
+
+    def supports_idempotent_cancellation(self, run_ids: Sequence[str] = ()) -> bool:
+        """Check retry safety without signaling workers."""
+        check.sequence_param(run_ids, "run_ids", of_type=str)
+        if len(run_ids) > MAX_CANCEL_EXECUTIONS_BATCH_SIZE:
+            return all(
+                self.supports_idempotent_cancellation(
+                    run_ids[offset : offset + MAX_CANCEL_EXECUTIONS_BATCH_SIZE]
+                )
+                for offset in range(0, len(run_ids), MAX_CANCEL_EXECUTIONS_BATCH_SIZE)
+            )
+        try:
+            reply = self._get_response(
+                "CancelExecutions",
+                dagster_api_pb2.CancelExecutionsRequest(
+                    serialized_cancel_executions_request=serialize_value(
+                        CancelExecutionsRequest(run_ids=[], capability_run_ids=run_ids or None)
+                    )
+                ),
+            )
+        except Exception as error:
+            if (
+                isinstance(error, grpc.RpcError)
+                and cast("grpc.Call", error).code() == grpc.StatusCode.UNIMPLEMENTED
+            ):
+                return False
+            self._raise_grpc_exception(error, timeout=DEFAULT_GRPC_TIMEOUT)
+        return deserialize_value(
+            reply.serialized_cancel_executions_result, CancelExecutionsResult
+        ).termination_requests_are_idempotent
+
+    def _cancel_executions_legacy(
+        self, run_ids: Sequence[str], *, check_existing: bool = False
+    ) -> CancelExecutionsResult:
+        results: dict[str, CancelExecutionResult] = {}
+        for run_id in run_ids:
+            try:
+                if check_existing:
+                    can_cancel = deserialize_value(
+                        self.can_cancel_execution(CanCancelExecutionRequest(run_id=run_id)),
+                        CanCancelExecutionResult,
+                    ).can_cancel
+                    if not can_cancel:
+                        # Do not reset an existing termination deadline.
+                        results[run_id] = CancelExecutionResult(
+                            success=False, message=None, serializable_error_info=None
+                        )
+                        continue
+                results[run_id] = deserialize_value(
+                    self.cancel_execution(CancelExecutionRequest(run_id=run_id)),
+                    CancelExecutionResult,
+                )
+            except Exception:
+                results[run_id] = CancelExecutionResult(
+                    success=False,
+                    message=None,
+                    serializable_error_info=serializable_error_info_from_exc_info(sys.exc_info()),
+                )
+        return CancelExecutionsResult(results=results)
+
+    def _cancel_executions(
+        self, run_ids: Sequence[str], *, require_idempotent: bool = False
+    ) -> CancelExecutionsResult:
+        try:
+            response = self._get_response(
+                "CancelExecutions",
+                dagster_api_pb2.CancelExecutionsRequest(
+                    serialized_cancel_executions_request=serialize_value(
+                        CancelExecutionsRequest(
+                            run_ids=run_ids, require_idempotent=require_idempotent
+                        )
+                    )
+                ),
+            )
+        except Exception as error:
+            if (
+                isinstance(error, grpc.RpcError)
+                and cast("grpc.Call", error).code() == grpc.StatusCode.UNIMPLEMENTED
+            ):
+                return self._cancel_executions_legacy(run_ids, check_existing=require_idempotent)
+            # Transport failures may occur after the request is accepted.
+            self._raise_grpc_exception(error, timeout=DEFAULT_GRPC_TIMEOUT)
+        result = deserialize_value(
+            response.serialized_cancel_executions_result, CancelExecutionsResult
+        )
+        check.invariant(
+            set(result.results) == set(run_ids), "Incomplete batch cancellation response"
+        )
+        return result
 
     def can_cancel_execution(
         self,

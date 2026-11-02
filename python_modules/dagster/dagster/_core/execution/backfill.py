@@ -614,8 +614,7 @@ def cancel_backfill_runs_and_cancellation_complete(
                     # Queue-raced runs already had their termination attempt this pass.
                     run_ids = [run.run_id for run in runs if run.run_id not in submitted_from_queue]
                 if run_ids:
-                    for run_id in run_ids:
-                        instance.run_launcher.terminate(run_id)
+                    instance.run_launcher.terminate_runs(run_ids)
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
