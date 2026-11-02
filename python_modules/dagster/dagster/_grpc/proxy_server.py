@@ -35,7 +35,7 @@ from dagster._grpc.types import (
     StartRunResult,
 )
 from dagster._serdes import deserialize_value, serialize_value
-from dagster._utils.error import serializable_error_info_from_exc_info
+from dagster._utils.error import SerializableErrorInfo, serializable_error_info_from_exc_info
 
 if TYPE_CHECKING:
     from dagster._grpc.client import DagsterGrpcClient
@@ -428,23 +428,21 @@ class DagsterProxyApiServicer(DagsterApiServicer):
                 grpc.StatusCode.INVALID_ARGUMENT, "Too many run IDs in cancellation request"
             )
         if not batch.run_ids:
-            # Probe only the requested generations, not unrelated or retired servers.
-            clients = (
-                {
-                    self._run_clients[run_id]
-                    for run_id in batch.capability_run_ids
-                    if run_id in self._run_clients
-                }
+            run_ids = (
+                batch.capability_run_ids
                 if batch.capability_run_ids is not None
-                else set(self._run_clients.values())
+                else self._run_clients
             )
-            supported = bool(clients)
+            clients = {
+                self._run_clients[run_id] for run_id in run_ids if run_id in self._run_clients
+            }
             try:
-                for client in clients:
-                    supported = supported and client.supports_idempotent_cancellation()
+                supported = (
+                    bool(clients)
+                    and all(run_id in self._run_clients for run_id in run_ids)
+                    and all(client.supports_idempotent_cancellation() for client in clients)
+                )
             except Exception:
-                # Capability discovery has no side effects. An unreachable generation
-                # disables SQL batching; actual cancellation retains per-run errors.
                 supported = False
             return dagster_api_pb2.CancelExecutionsReply(
                 serialized_cancel_executions_result=serialize_value(
@@ -453,23 +451,21 @@ class DagsterProxyApiServicer(DagsterApiServicer):
                     )
                 )
             )
-        # A proxy can retain runs from several code-server generations after a reload.
-        # Route each run to its original server rather than the current server.
+        # Each run belongs to its original code-server generation.
         by_client: dict[DagsterGrpcClient, list[str]] = {}
         results: dict[str, CancelExecutionResult] = {}
         for run_id in dict.fromkeys(batch.run_ids):
             client = self._run_clients.get(run_id)
             if client is None:
-                try:
-                    raise Exception(f"Could not find a server for run {run_id}")
-                except Exception:
-                    results[run_id] = CancelExecutionResult(
-                        success=False,
-                        message=None,
-                        serializable_error_info=serializable_error_info_from_exc_info(
-                            sys.exc_info()
-                        ),
-                    )
+                results[run_id] = CancelExecutionResult(
+                    success=False,
+                    message=None,
+                    serializable_error_info=SerializableErrorInfo(
+                        message=f"Could not find a server for run {run_id}",
+                        stack=[],
+                        cls_name="Exception",
+                    ),
+                )
             else:
                 by_client.setdefault(client, []).append(run_id)
         idempotent = True
