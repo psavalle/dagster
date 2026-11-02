@@ -239,8 +239,7 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
 
     @property
     def supports_queued_run_cancellation(self) -> bool:
-        # Cross-store atomicity is only possible for the stock stores sharing one database.
-        # Extensions must explicitly implement/opt into the new cancellation contract.
+        # The transaction requires stock run/event stores in one database.
         from dagster_postgres.run_storage import PostgresRunStorage
 
         if not self.has_instance:
@@ -267,7 +266,7 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
         run_storage = check.inst(self._instance.run_storage, PostgresRunStorage)
         has_end_time = run_storage.has_run_stats_index_cols()
         canceled_ids: list[str] = []
-        # All chunks share a real transaction, despite the ordinary AUTOCOMMIT engine.
+        # All chunks share one explicit transaction.
         with self._connect() as connection:
             conn = connection.execution_options(isolation_level="READ COMMITTED")
             with conn.begin():
@@ -346,7 +345,6 @@ class PostgresEventLogStorage(SqlEventLogStorage, ConfigurableClass):
                         f"{run_id}_{event_id}" for run_id, event_id in result.fetchall()
                     ]
                     result.close()
-                    # PostgreSQL delivers notifications only after the transaction commits.
                     conn.execute(
                         db.text(
                             "SELECT pg_notify(:channel, notification) "

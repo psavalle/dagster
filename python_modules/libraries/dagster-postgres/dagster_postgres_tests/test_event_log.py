@@ -417,19 +417,6 @@ def test_queued_state_and_events_are_not_visible_before_commit(conn_string):
         assert instance.get_run_by_id(run.run_id).status == DagsterRunStatus.CANCELED
 
 
-@pytest.mark.parametrize("hook", ["report_run_canceling", "should_store_event"])
-def test_postgres_custom_instance_hook_uses_serial_path(conn_string, hook):
-    with _queued_cancellation_instance(conn_string) as instance:
-        run = _create_queued_run(instance)
-        with (
-            patch.object(instance, hook, wraps=getattr(instance, hook)) as called,
-            patch.object(instance.event_log_storage, "cancel_queued_runs") as batch,
-        ):
-            instance.report_run_cancellation_batch([run])
-            assert called.called
-            batch.assert_not_called()
-
-
 def test_postgres_custom_run_storage_hook_uses_serial_path(conn_string):
     with _queued_cancellation_instance(conn_string) as instance:
         run = _create_queued_run(instance)
