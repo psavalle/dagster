@@ -586,8 +586,8 @@ def test_server_rejects_oversized_capability_probe_without_signaling():
         assert not server._termination_events["one"].is_set()  # noqa: SLF001
 
 
-@pytest.mark.parametrize("worker_failure", [False, True])
-def test_default_launcher_attempts_other_server_groups_after_failure(worker_failure):
+@pytest.mark.parametrize("failure", ["worker", "transport", "metadata"])
+def test_default_launcher_attempts_other_server_groups_after_failure(failure):
     with instance_for_test() as instance:
         runs = [create_run_for_test(instance, status=DagsterRunStatus.STARTED) for _ in range(2)]
         with (
@@ -601,22 +601,26 @@ def test_default_launcher_attempts_other_server_groups_after_failure(worker_fail
                     run.run_id,
                     {GRPC_INFO_TAG: json.dumps({"host": client.host, "port": client.port})},
                 )
-            if worker_failure:
+            if failure == "worker":
                 broken._termination_events[runs[0].run_id] = Mock(  # noqa: SLF001
                     set=Mock(side_effect=RuntimeError("signal failed"))
                 )
+            if failure == "metadata":
+                instance.add_run_tags(runs[0].run_id, {GRPC_INFO_TAG: "invalid JSON"})
             original = DagsterGrpcClient.cancel_executions
 
             def cancel(client, run_ids, **kwargs):
-                if not worker_failure and client.port == first.port:
+                if failure == "transport" and client.port == first.port:
                     raise DagsterUserCodeUnreachableError("server unavailable")
                 return original(client, run_ids, **kwargs)
 
             with patch.object(DagsterGrpcClient, "cancel_executions", cancel):
                 with pytest.raises(
-                    DagsterUserCodeProcessError
-                    if worker_failure
-                    else DagsterUserCodeUnreachableError
+                    {
+                        "worker": DagsterUserCodeProcessError,
+                        "transport": DagsterUserCodeUnreachableError,
+                        "metadata": ValueError,
+                    }[failure]
                 ):
                     launcher.terminate_runs([run.run_id for run in runs])
             assert healthy._termination_events[runs[1].run_id].is_set()  # noqa: SLF001

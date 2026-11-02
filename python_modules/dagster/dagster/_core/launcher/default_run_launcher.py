@@ -217,13 +217,14 @@ class DefaultRunLauncher(RunLauncher, ConfigurableClass):
             run = current_runs.get(run_id)
             if not run or run.is_finished:
                 continue
-            client = self._get_grpc_client_for_run(run)
-            if client is None:
-                try:
+            try:
+                client = self._get_grpc_client_for_run(run)
+                if client is None:
                     results[run_id] = self.terminate(run_id)
-                except Exception as exc:
-                    if first_error is None:
-                        first_error = exc
+                    continue
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 continue
             key = (client.host, client.port, client.socket, client.use_ssl)
             if key not in groups:
