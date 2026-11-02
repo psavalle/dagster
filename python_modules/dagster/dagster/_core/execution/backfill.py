@@ -29,7 +29,7 @@ from dagster._core.storage.dagster_run import (
     DagsterRunStatus,
     RunsFilter,
 )
-from dagster._core.storage.tags import BACKFILL_ID_TAG, USER_TAG
+from dagster._core.storage.tags import BACKFILL_ID_TAG, RUN_TERMINATION_REQUESTED_TAG, USER_TAG
 from dagster._core.workspace.context import BaseWorkspaceRequestContext
 from dagster._record import record
 from dagster._serdes import whitelist_for_serdes
@@ -545,6 +545,29 @@ class PartitionBackfill(
         )
 
 
+def _retry_pending_backfill_run_terminations(instance: "DagsterInstance", backfill_id: str) -> bool:
+    # Durable SQL intents survive commit uncertainty and launcher/RPC failures. Retry each
+    # pending page once per iteration, not in the active-run loop (which would spin).
+    retried_any_runs = False
+    cursor = None
+    while True:
+        pending = instance.run_storage.get_runs(
+            RunsFilter(
+                statuses=[DagsterRunStatus.CANCELING],
+                tags={BACKFILL_ID_TAG: backfill_id, RUN_TERMINATION_REQUESTED_TAG: "true"},
+            ),
+            cursor=cursor,
+            limit=CANCELABLE_RUNS_BATCH_SIZE,
+            ascending=True,
+        )
+        if not pending:
+            break
+        retried_any_runs = True
+        cursor = pending[-1].run_id
+        instance.run_launcher.terminate_runs([run.run_id for run in pending])
+    return retried_any_runs
+
+
 def cancel_backfill_runs_and_cancellation_complete(
     instance: "DagsterInstance", backfill_id: str, logger: logging.Logger
 ) -> bool:
@@ -557,6 +580,7 @@ def cancel_backfill_runs_and_cancellation_complete(
         check.failed("The instance must have a run coordinator in order to cancel runs")
 
     canceled_any_runs = False
+    retried_pending = False
 
     while True:
         # Cancel all cancelable runs for the backfill in batches
@@ -574,6 +598,14 @@ def cancel_backfill_runs_and_cancellation_complete(
         )
 
         if not runs_to_cancel_in_iteration:
+            # Keep queued cancellation first. Retry durable intents once, before marking
+            # new active runs, so a failed RPC neither blocks the queue nor spins here.
+            if not retried_pending:
+                canceled_any_runs = (
+                    _retry_pending_backfill_run_terminations(instance, backfill_id)
+                    or canceled_any_runs
+                )
+                retried_pending = True
             # once all queued runs are canceled, cancel all other cancelable runs
             runs_to_cancel_in_iteration = instance.run_storage.get_runs(
                 filters=RunsFilter(

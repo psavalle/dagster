@@ -458,6 +458,20 @@ class EventLogStorage(ABC, MayHaveInstanceWeakref[T_DagsterInstance]):
         """
         raise NotImplementedError("This storage does not support atomic queued-run cancellation")
 
+    @property
+    def supports_run_canceling_batch(self) -> bool:
+        """Whether cancellation intent, state and events can be committed atomically."""
+        return False
+
+    def mark_runs_canceling(self, runs: Sequence["DagsterRun"]) -> Sequence["DagsterRun"]:
+        """Mark unfinished runs CANCELING when their routing metadata still matches.
+
+        Return authoritative marked runs. Persist a durable termination-request tag so
+        cancellation can resume after an uncertain commit or a failed termination RPC.
+        Terminal runs and changed routes must be left untouched.
+        """
+        raise NotImplementedError("This storage does not support batched cancellation intent")
+
     @abstractmethod
     def delete_events(self, run_id: str) -> None:
         """Remove events for a given run id."""

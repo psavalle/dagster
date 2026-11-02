@@ -181,3 +181,58 @@ def test_custom_reporting_hooks_retain_serial_path(method):
             batch.assert_not_called()
             assert hook.called
         assert instance.get_run_by_id(run.run_id).status == DagsterRunStatus.CANCELED
+
+
+def test_pending_termination_intents_are_paginated_once_per_iteration():
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+
+    with instance_for_test() as instance:
+        runs = [
+            _queued_run(
+                instance,
+                status=DagsterRunStatus.CANCELING,
+                tags={BACKFILL_ID_TAG: "backfill", RUN_TERMINATION_REQUESTED_TAG: "true"},
+            )
+            for _ in range(3)
+        ]
+        _queued_run(instance, status=DagsterRunStatus.CANCELING, tags={BACKFILL_ID_TAG: "backfill"})
+        other = _queued_run(
+            instance,
+            status=DagsterRunStatus.CANCELING,
+            tags={BACKFILL_ID_TAG: "other", RUN_TERMINATION_REQUESTED_TAG: "true"},
+        )
+        with (
+            patch("dagster._core.execution.backfill.CANCELABLE_RUNS_BATCH_SIZE", 2),
+            patch.object(instance.run_launcher, "terminate_runs") as terminate,
+        ):
+            assert not cancel_backfill_runs_and_cancellation_complete(
+                instance, "backfill", logging.getLogger(__name__)
+            )
+            assert [call.args[0] for call in terminate.call_args_list] == [
+                [run.run_id for run in runs[:2]],
+                [runs[2].run_id],
+            ]
+        assert instance.get_run_by_id(other.run_id).status == DagsterRunStatus.CANCELING
+
+
+def test_queued_cancellation_precedes_failed_pending_retry():
+    from dagster._core.storage.tags import RUN_TERMINATION_REQUESTED_TAG
+
+    with instance_for_test() as instance:
+        queued = _queued_run(instance, tags={BACKFILL_ID_TAG: "backfill"})
+        pending = _queued_run(
+            instance,
+            status=DagsterRunStatus.CANCELING,
+            tags={BACKFILL_ID_TAG: "backfill", RUN_TERMINATION_REQUESTED_TAG: "true"},
+        )
+
+        def fail_retry(run_ids):
+            assert run_ids == [pending.run_id]
+            assert instance.get_run_by_id(queued.run_id).status == DagsterRunStatus.CANCELED
+            raise RuntimeError("pending RPC unavailable")
+
+        with patch.object(instance.run_launcher, "terminate_runs", side_effect=fail_retry):
+            with pytest.raises(RuntimeError, match="pending RPC unavailable"):
+                cancel_backfill_runs_and_cancellation_complete(
+                    instance, "backfill", logging.getLogger(__name__)
+                )
